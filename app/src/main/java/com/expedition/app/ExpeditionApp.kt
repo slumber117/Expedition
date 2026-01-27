@@ -1,6 +1,8 @@
 package com.expedition.app
 
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.List
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
@@ -16,6 +18,7 @@ import com.expedition.app.features.auth.AuthManager
 import com.expedition.app.features.auth.LoginScreen
 import com.expedition.app.features.auth.RegisterScreen
 import com.expedition.app.features.map.MapScreen
+import com.expedition.app.features.map.SavedRoutesScreen
 import com.expedition.app.features.social.FriendsScreen
 
 @Composable
@@ -58,6 +61,7 @@ fun ExpeditionApp() {
             composable("map") {
                 MapScreen(
                     onNavigateToFriends = { navController.navigate("friends") },
+                    onNavigateToSavedRoutes = { navController.navigate("savedRoutes") },
                     onLogout = {
                         navController.navigate("login") {
                             popUpTo("map") { inclusive = true }
@@ -73,6 +77,11 @@ fun ExpeditionApp() {
                         // from GroupSessionManager, so we just need to go back
                         navController.popBackStack()
                     }
+                )
+            }
+            composable("savedRoutes") {
+                SavedRoutesScreen(
+                    onNavigateBack = { navController.popBackStack() }
                 )
             }
         }

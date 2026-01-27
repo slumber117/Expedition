@@ -1,3 +1,4 @@
+
 package com.expedition.app.features.map
 
 import android.Manifest
@@ -63,6 +64,7 @@ import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 @Composable
 fun MapScreen(
     onNavigateToFriends: () -> Unit,
+    onNavigateToSavedRoutes: () -> Unit,
     onLogout: () -> Unit
 ) {
     val context = LocalContext.current
@@ -159,7 +161,7 @@ fun MapScreen(
     val mapView = remember {
         MapView(context).apply {
             setTileSource(TileSourceFactory.MAPNIK)
-            setMultiTouchControls(true)
+            setMultiTouchControls(false) // Disable multi-touch gestures
             controller.setZoom(17.0)
             setUseDataConnection(true)
             
@@ -560,6 +562,16 @@ fun MapScreen(
                 containerColor = MaterialTheme.colorScheme.tertiary
             ) {
                 Icon(Icons.Default.Person, contentDescription = "Friends")
+            }
+
+            Spacer(modifier = Modifier.size(16.dp))
+
+            FloatingActionButton(
+                onClick = onNavigateToSavedRoutes,
+                modifier = Modifier.size(64.dp),
+                containerColor = MaterialTheme.colorScheme.tertiary
+            ) {
+                Icon(Icons.Default.List, contentDescription = "Saved Routes")
             }
         }
         
