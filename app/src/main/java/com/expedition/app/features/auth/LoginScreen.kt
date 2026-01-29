@@ -16,14 +16,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.expedition.app.ui.theme.ExpeditionOrange
-import com.expedition.app.ui.theme.ExpeditionOrangeDark
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -32,8 +29,7 @@ fun LoginScreen(
     onLoginSuccess: (User) -> Unit,
     onNavigateToRegister: () -> Unit
 ) {
-    val context = LocalContext.current
-    val authManager = remember { AuthManager(context) }
+    val authManager = remember { FirebaseAuthManager() }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
 

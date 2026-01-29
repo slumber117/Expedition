@@ -1,0 +1,29 @@
+      {
+        "project_info": {
+          "project_number": "511939688271",
+          "project_id": "expedition-ad513",
+          "storage_bucket": "expedition-ad513.firebasestorage.app"
+        },
+        "client": [
+          {
+            "client_info": {
+              "mobilesdk_app_id": "1:511939688271:android:a2457518fc3f35bca8373a",
+              "android_client_info": {
+                "package_name": "com.expedition.app"
+              }
+            },
+            "oauth_client": [],
+            "api_key": [
+              {
+                "current_key": "AIzaSyAIJr5b-kodw0ZfRyK5oHGyOWow0H1UTts"
+              }
+            ],
+            "services": {
+              "appinvite_service": {
+                "other_platform_oauth_client": []
+              }
+            }
+          }
+        ],
+        "configuration_version": "1"
+      }

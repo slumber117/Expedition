@@ -1,18 +1,25 @@
 package com.expedition.app.features.map
 
 import android.content.Context
-import android.location.Location
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import org.osmdroid.util.GeoPoint
-import org.osmdroid.views.MapView
-import org.osmdroid.views.overlay.Polyline
 import android.graphics.Color
+import android.location.Location
+import com.expedition.app.BuildConfig
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.io.File
+import java.io.InputStreamReader
+import java.net.HttpURLConnection
+import java.net.URL
 import kotlin.math.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.Polyline
 
 /**
  * Data class representing a saved route
@@ -25,51 +32,55 @@ data class SavedRoute(
     val createdAt: Long = System.currentTimeMillis()
 )
 
+// Data classes for parsing Google Directions API response
+data class DirectionsResponse(val routes: List<Route>)
+data class Route(val overview_polyline: OverviewPolyline, val legs: List<Leg>)
+data class OverviewPolyline(val points: String)
+data class Leg(val distance: Distance, val duration: Duration)
+data class Distance(val value: Int)
+data class Duration(val value: Int)
+
+
 /**
- * Manages navigation, routes, and ETA calculations
+ * Manages navigation, route calculation, and ETA
  */
 class NavigationManager(private val context: Context) {
-    
-    private val gson = Gson()
-    private val routesFile = File(context.filesDir, "saved_routes.json")
-    
-    // Current navigation state
+
     private val _destination = MutableStateFlow<GeoPoint?>(null)
     val destination: StateFlow<GeoPoint?> = _destination.asStateFlow()
-    
+
     private val _currentRoute = MutableStateFlow<List<GeoPoint>>(emptyList())
     val currentRoute: StateFlow<List<GeoPoint>> = _currentRoute.asStateFlow()
-    
-    private val _distanceToDestination = MutableStateFlow(0.0) // meters
+
+    private val _distanceToDestination = MutableStateFlow(0.0)
     val distanceToDestination: StateFlow<Double> = _distanceToDestination.asStateFlow()
-    
-    private val _etaSeconds = MutableStateFlow<Long?>(null)
-    val etaSeconds: StateFlow<Long?> = _etaSeconds.asStateFlow()
-    
+
+    private val _etaSeconds = MutableStateFlow<Int?>(null)
+    val etaSeconds: StateFlow<Int?> = _etaSeconds.asStateFlow()
+
     private val _savedRoutes = MutableStateFlow<List<SavedRoute>>(emptyList())
     val savedRoutes: StateFlow<List<SavedRoute>> = _savedRoutes.asStateFlow()
-    
+
     private var routeOverlay: Polyline? = null
     
+    private val apiKey = BuildConfig.MAPS_API_KEY
+
     init {
         loadSavedRoutes()
     }
-    
+
     /**
-     * Set a destination and calculate route from current location
+     * Set a destination and calculate route from a routing API
      */
     fun setDestination(currentLocation: GeoPoint, destination: GeoPoint) {
         _destination.value = destination
         
-        // Generate route waypoints (simple straight-line for now, could integrate with routing API)
-        val waypoints = generateRouteWaypoints(currentLocation, destination)
-        _currentRoute.value = waypoints
-        
-        // Calculate total distance
-        val distance = calculateTotalDistance(waypoints)
-        _distanceToDestination.value = distance
+        // Launch a coroutine to fetch the route from the API
+        CoroutineScope(Dispatchers.IO).launch {
+            fetchAndApplyRoute(currentLocation, destination)
+        }
     }
-    
+
     /**
      * Clear current navigation
      */
@@ -79,231 +90,228 @@ class NavigationManager(private val context: Context) {
         _distanceToDestination.value = 0.0
         _etaSeconds.value = null
     }
-    
+
     /**
      * Update ETA based on current speed and remaining distance
-     * Should be called every 500ms for real-time updates
      */
-    fun updateETA(currentLocation: Location, speedKmh: Float) {
-        val dest = _destination.value ?: return
-        
-        // Calculate remaining distance from current position to destination
-        val remainingDistance = calculateDistance(
-            currentLocation.latitude, currentLocation.longitude,
-            dest.latitude, dest.longitude
+    fun updateETA(currentLocation: Location, currentSpeedKmh: Double) {
+        val route = _currentRoute.value
+        if (route.isEmpty() || destination.value == null) {
+            _etaSeconds.value = null
+            return
+        }
+
+        val remainingDistance = calculateRemainingDistance(
+            GeoPoint(currentLocation.latitude, currentLocation.longitude),
+            route
         )
         _distanceToDestination.value = remainingDistance
-        
-        // Calculate ETA
-        if (speedKmh > 1f) { // Only calculate if moving
-            val speedMs = speedKmh / 3.6f // Convert km/h to m/s
-            val etaSec = (remainingDistance / speedMs).toLong()
-            _etaSeconds.value = etaSec
-        } else {
-            // If stopped, keep the last ETA or show null
-            // Don't update to prevent flickering
+
+        val speedMps = currentSpeedKmh * 1000 / 3600
+        if (speedMps > 1) { // Only update if moving
+            _etaSeconds.value = (remainingDistance / speedMps).toInt()
         }
     }
-    
+
     /**
-     * Draw route on map
+     * Draw the current route on the map
      */
     fun drawRouteOnMap(mapView: MapView) {
-        // Remove old route
-        routeOverlay?.let { mapView.overlays.remove(it) }
-        
-        val waypoints = _currentRoute.value
-        if (waypoints.isEmpty()) return
-        
-        routeOverlay = Polyline().apply {
-            setPoints(waypoints)
-            outlinePaint.color = Color.parseColor("#2196F3") // Material Blue
-            outlinePaint.strokeWidth = 12f
+        // Remove old route overlay
+        routeOverlay?.let {
+            mapView.overlays.remove(it)
         }
-        
-        mapView.overlays.add(routeOverlay)
-        mapView.invalidate()
+
+        // Add new route overlay
+        if (_currentRoute.value.isNotEmpty()) {
+            val polyline = Polyline().apply {
+                setPoints(_currentRoute.value)
+                color = Color.BLUE
+                width = 12f
+            }
+            mapView.overlays.add(polyline)
+            routeOverlay = polyline
+            mapView.invalidate() // Refresh the map
+        }
     }
-    
+
     /**
-     * Save current route for offline use
+     * Save the current route to a file
      */
-    fun saveCurrentRoute(name: String): SavedRoute? {
-        val waypoints = _currentRoute.value
-        if (waypoints.isEmpty()) return null
-        
-        val route = SavedRoute(
-            id = System.currentTimeMillis().toString(),
-            name = name,
-            waypoints = waypoints,
+    fun saveCurrentRoute(routeName: String) {
+        val route = _currentRoute.value
+        if (route.isEmpty() || routeName.isBlank()) return
+
+        val newRoute = SavedRoute(
+            id = "route_${System.currentTimeMillis()}",
+            name = routeName,
+            waypoints = route,
             totalDistanceMeters = _distanceToDestination.value
         )
-        
-        val routes = _savedRoutes.value.toMutableList()
-        routes.add(route)
-        _savedRoutes.value = routes
-        
-        persistRoutes(routes)
-        return route
+
+        val updatedRoutes = _savedRoutes.value.toMutableList().apply { add(newRoute) }
+        _savedRoutes.value = updatedRoutes
+        saveRoutesToFile()
     }
-    
-    /**
-     * Load a saved route
-     */
-    fun loadRoute(routeId: String): SavedRoute? {
-        val route = _savedRoutes.value.find { it.id == routeId }
-        route?.let {
-            _currentRoute.value = it.waypoints
-            _distanceToDestination.value = it.totalDistanceMeters
-            if (it.waypoints.isNotEmpty()) {
-                _destination.value = it.waypoints.last()
-            }
-        }
-        return route
-    }
-    
+
     /**
      * Delete a saved route
      */
-    fun deleteRoute(routeId: String) {
-        val routes = _savedRoutes.value.filter { it.id != routeId }
-        _savedRoutes.value = routes
-        persistRoutes(routes)
+    fun deleteSavedRoute(routeId: String) {
+        val updatedRoutes = _savedRoutes.value.filter { it.id != routeId }
+        _savedRoutes.value = updatedRoutes
+        saveRoutesToFile()
     }
-    
-    /**
-     * Generate route waypoints between two points
-     * This is a simplified version - in production, you'd use a routing API like OSRM or GraphHopper
-     */
-    private fun generateRouteWaypoints(start: GeoPoint, end: GeoPoint): List<GeoPoint> {
-        val waypoints = mutableListOf<GeoPoint>()
-        
-        // Add start
-        waypoints.add(start)
-        
-        // Add intermediate points for smoother visualization
-        val steps = 10
-        for (i in 1 until steps) {
-            val fraction = i.toDouble() / steps
-            val lat = start.latitude + (end.latitude - start.latitude) * fraction
-            val lon = start.longitude + (end.longitude - start.longitude) * fraction
-            waypoints.add(GeoPoint(lat, lon))
+
+    private fun loadSavedRoutes() {
+        try {
+            val file = File(context.filesDir, "saved_routes.json")
+            if (file.exists()) {
+                val json = file.readText()
+                val type = object : TypeToken<List<SavedRoute>>() {}.type
+                _savedRoutes.value = Gson().fromJson(json, type) ?: emptyList()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
-        
-        // Add end
-        waypoints.add(end)
-        
-        return waypoints
     }
-    
+
+    private fun saveRoutesToFile() {
+        try {
+            val file = File(context.filesDir, "saved_routes.json")
+            val json = Gson().toJson(_savedRoutes.value)
+            file.writeText(json)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /**
+     * Fetches route from Google Directions API and updates state
+     */
+    private fun fetchAndApplyRoute(start: GeoPoint, end: GeoPoint) {
+        val urlString = "https://maps.googleapis.com/maps/api/directions/json?" +
+                "origin=${start.latitude},${start.longitude}&" +
+                "destination=${end.latitude},${end.longitude}&" +
+                "key=$apiKey"
+
+        val url = URL(urlString)
+        val connection = url.openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+
+        try {
+            val reader = InputStreamReader(connection.inputStream)
+            val response = Gson().fromJson(reader, DirectionsResponse::class.java)
+            reader.close()
+
+            if (response.routes.isNotEmpty()) {
+                val route = response.routes[0]
+                
+                // Decode polyline and update current route
+                _currentRoute.value = decodePolyline(route.overview_polyline.points)
+
+                // Update distance and ETA from the API response
+                val totalDistance = route.legs.sumOf { it.distance.value }.toDouble()
+                val totalDuration = route.legs.sumOf { it.duration.value }
+                _distanceToDestination.value = totalDistance
+                _etaSeconds.value = totalDuration
+
+            } else {
+                // Handle no route found
+                clearNavigation()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            clearNavigation()
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    /**
+     * Decode polyline string from Google Maps API to a list of GeoPoints
+     *
+     * Courtesy of: https://stackoverflow.com/questions/39851243/android-ios-decode-google-maps-encoded-polyline-string
+     */
+    private fun decodePolyline(encoded: String): List<GeoPoint> {
+        val poly = ArrayList<GeoPoint>()
+        var index = 0
+        val len = encoded.length
+        var lat = 0
+        var lng = 0
+
+        while (index < len) {
+            var b: Int
+            var shift = 0
+            var result = 0
+            do {
+                b = encoded[index++].code - 63
+                result = result or (b and 0x1f shl shift)
+                shift += 5
+            } while (b >= 0x20)
+            val dlat = if (result and 1 != 0) (result shr 1).inv() else result shr 1
+            lat += dlat
+
+            shift = 0
+            result = 0
+            do {
+                b = encoded[index++].code - 63
+                result = result or (b and 0x1f shl shift)
+                shift += 5
+            } while (b >= 0x20)
+            val dlng = if (result and 1 != 0) (result shr 1).inv() else result shr 1
+            lng += dlng
+
+            val p = GeoPoint(lat.toDouble() / 1E5, lng.toDouble() / 1E5)
+            poly.add(p)
+        }
+
+        return poly
+    }
+
     /**
      * Calculate total distance of a route in meters
      */
     private fun calculateTotalDistance(waypoints: List<GeoPoint>): Double {
-        var total = 0.0
+        var totalDistance = 0.0
         for (i in 0 until waypoints.size - 1) {
-            total += calculateDistance(
-                waypoints[i].latitude, waypoints[i].longitude,
-                waypoints[i + 1].latitude, waypoints[i + 1].longitude
-            )
+            totalDistance += waypoints[i].distanceToAsDouble(waypoints[i + 1])
         }
-        return total
+        return totalDistance
     }
-    
+
     /**
-     * Calculate distance between two points using Haversine formula
+     * Calculate remaining distance from a point on the route
      */
-    private fun calculateDistance(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-        val earthRadius = 6371000.0 // meters
-        
-        val dLat = Math.toRadians(lat2 - lat1)
-        val dLon = Math.toRadians(lon2 - lon1)
-        
-        val a = sin(dLat / 2).pow(2) +
-                cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) *
-                sin(dLon / 2).pow(2)
-        
-        val c = 2 * atan2(sqrt(a), sqrt(1 - a))
-        
-        return earthRadius * c
-    }
-    
-    /**
-     * Save routes to file for persistence
-     */
-    private fun persistRoutes(routes: List<SavedRoute>) {
-        try {
-            // Convert GeoPoints to serializable format
-            val serializableRoutes = routes.map { route ->
-                mapOf(
-                    "id" to route.id,
-                    "name" to route.name,
-                    "waypoints" to route.waypoints.map { listOf(it.latitude, it.longitude) },
-                    "totalDistanceMeters" to route.totalDistanceMeters,
-                    "createdAt" to route.createdAt
-                )
-            }
-            routesFile.writeText(gson.toJson(serializableRoutes))
-        } catch (e: Exception) {
-            e.printStackTrace()
+    private fun calculateRemainingDistance(currentLocation: GeoPoint, route: List<GeoPoint>): Double {
+        // Find the closest point on the route
+        val closestPointIndex = route.indices.minByOrNull {
+            currentLocation.distanceToAsDouble(route[it])
+        } ?: return 0.0
+
+        // Calculate distance from the closest point to the end of the route
+        var remainingDistance = 0.0
+        for (i in closestPointIndex until route.size - 1) {
+            remainingDistance += route[i].distanceToAsDouble(route[i + 1])
         }
+
+        return remainingDistance
     }
-    
-    /**
-     * Load routes from file
-     */
-    private fun loadSavedRoutes() {
-        try {
-            if (routesFile.exists()) {
-                val json = routesFile.readText()
-                val type = object : TypeToken<List<Map<String, Any>>>() {}.type
-                val rawRoutes: List<Map<String, Any>> = gson.fromJson(json, type)
-                
-                _savedRoutes.value = rawRoutes.map { raw ->
-                    @Suppress("UNCHECKED_CAST")
-                    val waypointsList = raw["waypoints"] as List<List<Double>>
-                    SavedRoute(
-                        id = raw["id"] as String,
-                        name = raw["name"] as String,
-                        waypoints = waypointsList.map { GeoPoint(it[0], it[1]) },
-                        totalDistanceMeters = (raw["totalDistanceMeters"] as Number).toDouble(),
-                        createdAt = (raw["createdAt"] as Number).toLong()
-                    )
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-    
+
     companion object {
-        /**
-         * Format ETA seconds to human-readable string
-         */
-        fun formatETA(seconds: Long): String {
-            return when {
-                seconds < 60 -> "${seconds}s"
-                seconds < 3600 -> {
-                    val mins = seconds / 60
-                    val secs = seconds % 60
-                    "${mins}m ${secs}s"
-                }
-                else -> {
-                    val hours = seconds / 3600
-                    val mins = (seconds % 3600) / 60
-                    "${hours}h ${mins}m"
-                }
+        fun formatDistance(meters: Double?): String {
+            if (meters == null) return "N/A"
+            return if (meters > 1000) {
+                String.format("%.1f km", meters / 1000)
+            } else {
+                String.format("%d m", meters.toInt())
             }
         }
-        
-        /**
-         * Format distance to human-readable string
-         */
-        fun formatDistance(meters: Double): String {
-            return when {
-                meters < 1000 -> "${meters.toInt()}m"
-                else -> String.format("%.1fkm", meters / 1000)
-            }
+
+        fun formatETA(seconds: Int?): String {
+            if (seconds == null) return "N/A"
+            val minutes = seconds / 60
+            return "$minutes min"
         }
     }
 }

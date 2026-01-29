@@ -233,7 +233,8 @@ fun RegisterScreen(
                                     val result = authManager.register(
                                         email = email,
                                         password = password,
-                                        displayName = displayName
+                                        displayName = displayName,
+                                        accountType = accountType
                                     )
                                     isLoading = false
                                     when (result) {
