@@ -22,6 +22,15 @@ import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Polyline
 
 /**
+ * Supported travel modes for routing
+ */
+enum class TravelMode(val osrmProfile: String) {
+    DRIVING("driving"),
+    WALKING("foot"),
+    CYCLING("cycling")
+}
+
+/**
  * Data class representing a saved route
  */
 data class SavedRoute(
@@ -70,6 +79,9 @@ class NavigationManager(private val context: Context) {
 
     private val _savedRoutes = MutableStateFlow<List<SavedRoute>>(emptyList())
     val savedRoutes: StateFlow<List<SavedRoute>> = _savedRoutes.asStateFlow()
+
+    private val _travelMode = MutableStateFlow(TravelMode.DRIVING)
+    val travelMode: StateFlow<TravelMode> = _travelMode.asStateFlow()
 
     private var routeOverlay: Polyline? = null
     
@@ -132,13 +144,34 @@ class NavigationManager(private val context: Context) {
         _distanceToDestination.value = remainingDistance
 
         val speedMps = currentSpeedKmh * 1000 / 3600
-        if (speedMps > 1) {
+        
+        // Threshold: 0.5 m/s (~1.8 km/h). Below this, we assume the user is stationary.
+        // If not moving, we clear the ETA as per user request.
+        if (speedMps > 0.5) {
             _etaSeconds.value = (remainingDistance / speedMps).toInt()
+        } else {
+            _etaSeconds.value = null
         }
 
         // Periodically update elevation/weather for current position if needed
         CoroutineScope(Dispatchers.IO).launch {
             fetchElevation(GeoPoint(currentLocation.latitude, currentLocation.longitude))
+        }
+    }
+
+    /**
+     * Change travel mode and recalculate route if active
+     */
+    fun setTravelMode(mode: TravelMode) {
+        if (_travelMode.value == mode) return
+        _travelMode.value = mode
+        
+        // Recalculate route if destination is set
+        val dest = _destination.value
+        if (dest != null) {
+            // We need current location to recalculate. 
+            // In a real app, we'd get it from LocationTracker. 
+            // For now, it will be recalculated on the next progress update or move.
         }
     }
 
@@ -229,8 +262,9 @@ class NavigationManager(private val context: Context) {
      * Fetches route from OSRM (Open Source Routing Machine) - Free, no API Key needed
      */
     private fun fetchAndApplyRoute(start: GeoPoint, end: GeoPoint) {
+        val profile = _travelMode.value.osrmProfile
         // OSRM expects coordinates in Lon,Lat format
-        val urlString = "https://router.project-osrm.org/route/v1/driving/" +
+        val urlString = "https://router.project-osrm.org/route/v1/$profile/" +
                 "${start.longitude},${start.latitude};${end.longitude},${end.latitude}" +
                 "?overview=full&geometries=polyline"
 
@@ -248,7 +282,7 @@ class NavigationManager(private val context: Context) {
                 val route = response.routes[0]
                 _currentRoute.value = decodePolyline(route.geometry)
                 _distanceToDestination.value = route.distance
-                _etaSeconds.value = route.duration.toInt()
+                // ETA is not calculated here but in updateProgress based on real speed
             }
         } catch (e: Exception) {
             e.printStackTrace()

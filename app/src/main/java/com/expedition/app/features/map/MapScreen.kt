@@ -1,15 +1,12 @@
 package com.expedition.app.features.map
 
 import android.Manifest
-import android.content.Context
-import android.location.Location
 import android.preference.PreferenceManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -18,16 +15,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import com.expedition.app.features.auth.AuthManager
 import com.expedition.app.features.social.GroupSessionManager
 import com.expedition.app.features.social.FriendStatus
-import com.expedition.app.ui.theme.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -35,7 +29,6 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import android.content.pm.PackageManager
-import android.view.MotionEvent
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.osmdroid.config.Configuration
@@ -60,15 +53,12 @@ fun MapScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     
     // Managers
-    val authManager = remember { AuthManager(context) }
     val sessionManager = remember { GroupSessionManager(context) }
     val locationTracker = remember { LocationTracker(context) }
     val navigationManager = remember { NavigationManager(context) }
-    val offlineCacheManager = remember { OfflineCacheManager(context) }
     val searchManager = remember { PlaceSearchManager() }
     
     // Location state
-    val currentUser by authManager.currentUser.collectAsState()
     val currentLocation by locationTracker.currentLocation.collectAsState()
     val speedKmh by locationTracker.speedKmh.collectAsState()
     val isOfflineMode by locationTracker.isOfflineMode.collectAsState()
@@ -84,11 +74,11 @@ fun MapScreen(
     val currentRoute by navigationManager.currentRoute.collectAsState()
     val elevation by navigationManager.elevation.collectAsState()
     val weather by navigationManager.weather.collectAsState()
+    val travelMode by navigationManager.travelMode.collectAsState()
     
     // UI state
     var searchQuery by remember { mutableStateOf("") }
     var searchResults by remember { mutableStateOf<List<SearchResult>>(emptyList()) }
-    var isSearching by remember { mutableStateOf(false) }
     var showSaveRouteDialog by remember { mutableStateOf(false) }
     var routeName by remember { mutableStateOf("") }
     var destinationMarker by remember { mutableStateOf<Marker?>(null) }
@@ -171,10 +161,8 @@ fun MapScreen(
     // Search suggestions debounce
     LaunchedEffect(searchQuery) {
         if (searchQuery.length > 2) {
-            isSearching = true
             delay(500) // Debounce
             searchResults = searchManager.search(searchQuery)
-            isSearching = false
         } else {
             searchResults = emptyList()
         }
@@ -416,6 +404,43 @@ fun MapScreen(
                     }
                     
                     Divider(modifier = Modifier.padding(vertical = 12.dp))
+
+                    // Travel Mode Selector
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TravelModeButton(
+                            mode = TravelMode.DRIVING,
+                            isSelected = travelMode == TravelMode.DRIVING,
+                            icon = Icons.Default.DirectionsCar,
+                            onClick = { 
+                                navigationManager.setTravelMode(TravelMode.DRIVING)
+                                currentLocation?.let { loc ->
+                                    destination?.let { dest ->
+                                        navigationManager.setDestination(GeoPoint(loc.latitude, loc.longitude), dest)
+                                    }
+                                }
+                            }
+                        )
+                        Spacer(modifier = Modifier.width(16.dp))
+                        TravelModeButton(
+                            mode = TravelMode.WALKING,
+                            isSelected = travelMode == TravelMode.WALKING,
+                            icon = Icons.Default.DirectionsWalk,
+                            onClick = { 
+                                navigationManager.setTravelMode(TravelMode.WALKING)
+                                currentLocation?.let { loc ->
+                                    destination?.let { dest ->
+                                        navigationManager.setDestination(GeoPoint(loc.latitude, loc.longitude), dest)
+                                    }
+                                }
+                            }
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
                     
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -537,6 +562,40 @@ fun MapScreen(
 }
 
 @Composable
+fun TravelModeButton(
+    mode: TravelMode,
+    isSelected: Boolean,
+    icon: ImageVector,
+    onClick: () -> Unit
+) {
+    Surface(
+        modifier = Modifier
+            .clip(CircleShape)
+            .clickable(onClick = onClick),
+        color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+        border = if (isSelected) null else BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = mode.name,
+                modifier = Modifier.size(18.dp),
+                tint = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(
+                text = mode.name.lowercase().replaceFirstChar { it.uppercase() },
+                style = MaterialTheme.typography.labelMedium,
+                color = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
 fun PersistentDashboard(
     speedKmh: Float,
     elevation: Double?,
@@ -613,7 +672,7 @@ fun DashboardItem(icon: ImageVector, value: String, unit: String, label: String)
 }
 
 @Composable
-fun EnvironmentalInfoItem(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, value: String) {
+fun EnvironmentalInfoItem(icon: ImageVector, label: String, value: String) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Icon(icon, null, modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
