@@ -12,35 +12,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.tasks.await
 
 /**
- * User account types
- */
-enum class AccountType {
-    REGULAR,
-    SUPERVISOR,
-    ADMIN
-}
-
-/**
- * User data model
- */
-data class User(
-    val id: String,
-    val email: String,
-    val displayName: String,
-    val accountType: AccountType = AccountType.REGULAR,
-    val createdAt: Long,
-    val lastLoginAt: Long
-)
-
-/**
- * Authentication result
- */
-sealed class AuthResult {
-    data class Success(val user: User) : AuthResult()
-    data class Error(val message: String) : AuthResult()
-}
-
-/**
  * Manages user authentication, registration, and session state using Firebase
  */
 class FirebaseAuthManager {

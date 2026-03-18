@@ -1,26 +1,38 @@
 package com.expedition.app.features.social
 
 import android.content.Context
-import com.google.gson.Gson
-import com.google.gson.reflect.TypeToken
+import com.expedition.app.features.auth.User
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.FieldValue
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.firestore.ktx.firestore
+import com.google.firebase.firestore.ktx.toObject
+import com.google.firebase.ktx.Firebase
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import org.osmdroid.util.GeoPoint
-import java.io.File
 import java.util.UUID
 
 /**
- * Represents a friend/contact in the app
+ * Represents a friend/contact in the app (UI Model)
  */
 data class Friend(
-    val id: String = UUID.randomUUID().toString(),
-    val name: String,
+    val id: String = "",
+    val name: String = "",
     val status: FriendStatus = FriendStatus.OFFLINE,
-    val lastKnownLocation: GeoPoint? = null,
+    val lastKnownLat: Double? = null,
+    val lastKnownLon: Double? = null,
     val currentSpeed: Float = 0f,
     val lastUpdated: Long = System.currentTimeMillis()
-)
+) {
+    val lastKnownLocation: GeoPoint? get() = if (lastKnownLat != null && lastKnownLon != null) GeoPoint(lastKnownLat, lastKnownLon) else null
+}
 
 enum class FriendStatus {
     ONLINE,
@@ -33,24 +45,28 @@ enum class FriendStatus {
  * Represents a group riding session
  */
 data class GroupSession(
-    val id: String = UUID.randomUUID().toString(),
-    val name: String,
-    val destination: GeoPoint,
-    val destinationName: String,
-    val creatorId: String,
-    val memberIds: MutableList<String> = mutableListOf(),
+    val id: String = "",
+    val name: String = "",
+    val destLat: Double = 0.0,
+    val destLon: Double = 0.0,
+    val destinationName: String = "",
+    val creatorId: String = "",
+    val memberIds: List<String> = emptyList(),
     val createdAt: Long = System.currentTimeMillis(),
+    @field:JvmField
     val isActive: Boolean = true
-)
+) {
+    val destination: GeoPoint get() = GeoPoint(destLat, destLon)
+}
 
 /**
- * Manages friends and group sessions
+ * Manages friends and group sessions using Firebase Firestore
  */
 class GroupSessionManager(private val context: Context) {
     
-    private val gson = Gson()
-    private val friendsFile = File(context.filesDir, "friends.json")
-    private val sessionsFile = File(context.filesDir, "sessions.json")
+    private val db = Firebase.firestore
+    private val auth = FirebaseAuth.getInstance()
+    private val scope = CoroutineScope(Dispatchers.Main)
     
     private val _friends = MutableStateFlow<List<Friend>>(emptyList())
     val friends: StateFlow<List<Friend>> = _friends.asStateFlow()
@@ -61,295 +77,216 @@ class GroupSessionManager(private val context: Context) {
     private val _currentSession = MutableStateFlow<GroupSession?>(null)
     val currentSession: StateFlow<GroupSession?> = _currentSession.asStateFlow()
     
-    // Current user ID (in production, this would come from auth)
-    private val currentUserId = "current_user"
+    private var friendsListener: ListenerRegistration? = null
+    private var sessionsListener: ListenerRegistration? = null
     
     init {
-        loadFriends()
-        loadSessions()
-        
-        // Add some demo friends if empty
-        if (_friends.value.isEmpty()) {
-            addDemoFriends()
-        }
+        observeFriends()
+        observeSessions()
     }
     
-    /**
-     * Add a new friend
-     */
-    fun addFriend(name: String): Friend {
-        val friend = Friend(
-            name = name,
-            status = FriendStatus.OFFLINE
+    private fun observeFriends() {
+        val currentUser = auth.currentUser ?: return
+        
+        // Listen to current user's document to get their friendIds
+        db.collection("users").document(currentUser.uid)
+            .addSnapshotListener { snapshot, e ->
+                if (e != null || snapshot == null) return@addSnapshotListener
+                
+                val user = snapshot.toObject<User>()
+                val friendIds = user?.friendIds ?: emptyList()
+                
+                if (friendIds.isEmpty()) {
+                    _friends.value = emptyList()
+                    return@addSnapshotListener
+                }
+                
+                // Fetch details for all friends
+                // Note: Firestore 'in' query supports up to 30 items.
+                db.collection("users")
+                    .whereIn("id", friendIds)
+                    .addSnapshotListener { friendsSnapshot, fe ->
+                        if (fe != null) return@addSnapshotListener
+                        
+                        val friendsList = friendsSnapshot?.documents?.mapNotNull { doc ->
+                            val friendUser = doc.toObject<User>()
+                            friendUser?.let {
+                                Friend(
+                                    id = doc.id,
+                                    name = it.displayName,
+                                    status = try { FriendStatus.valueOf(it.status) } catch(e: Exception) { FriendStatus.OFFLINE },
+                                    lastKnownLat = it.lastKnownLat,
+                                    lastKnownLon = it.lastKnownLon,
+                                    currentSpeed = it.currentSpeed,
+                                    lastUpdated = System.currentTimeMillis()
+                                )
+                            }
+                        } ?: emptyList()
+                        
+                        _friends.value = friendsList
+                    }
+            }
+    }
+    
+    private fun observeSessions() {
+        val currentUser = auth.currentUser ?: return
+        
+        sessionsListener = db.collection("sessions")
+            .whereEqualTo("isActive", true)
+            .addSnapshotListener { snapshot, e ->
+                if (e != null) return@addSnapshotListener
+                
+                val sessionsList = snapshot?.documents?.mapNotNull { doc ->
+                    doc.toObject<GroupSession>()?.copy(id = doc.id)
+                } ?: emptyList()
+                
+                _sessions.value = sessionsList
+                _currentSession.value = sessionsList.find { it.memberIds.contains(currentUser.uid) }
+            }
+    }
+    
+    fun updateMyLocation(location: GeoPoint, speed: Float, status: FriendStatus) {
+        val currentUser = auth.currentUser ?: return
+        val updates = mapOf(
+            "lastKnownLat" to location.latitude,
+            "lastKnownLon" to location.longitude,
+            "currentSpeed" to speed,
+            "status" to status.name
         )
-        
-        val updated = _friends.value.toMutableList()
-        updated.add(friend)
-        _friends.value = updated
-        saveFriends()
-        
-        return friend
+        db.collection("users").document(currentUser.uid).update(updates)
     }
     
-    /**
-     * Remove a friend
-     */
-    fun removeFriend(friendId: String) {
-        val updated = _friends.value.filter { it.id != friendId }
-        _friends.value = updated
-        saveFriends()
-    }
-    
-    /**
-     * Update friend's location and status (would be called via real-time sync in production)
-     */
-    fun updateFriendLocation(friendId: String, location: GeoPoint, speed: Float, status: FriendStatus) {
-        val updated = _friends.value.map { friend ->
-            if (friend.id == friendId) {
-                friend.copy(
-                    lastKnownLocation = location,
-                    currentSpeed = speed,
-                    status = status,
-                    lastUpdated = System.currentTimeMillis()
-                )
-            } else friend
-        }
-        _friends.value = updated
-    }
-    
-    /**
-     * Create a new group session
-     */
-    fun createSession(
+    suspend fun createSession(
         name: String,
         destination: GeoPoint,
         destinationName: String,
         invitedFriendIds: List<String> = emptyList()
-    ): GroupSession {
+    ): GroupSession? {
+        val currentUser = auth.currentUser ?: return null
+        
         val session = GroupSession(
+            id = UUID.randomUUID().toString(),
             name = name,
-            destination = destination,
+            destLat = destination.latitude,
+            destLon = destination.longitude,
             destinationName = destinationName,
-            creatorId = currentUserId,
-            memberIds = (listOf(currentUserId) + invitedFriendIds).toMutableList()
+            creatorId = currentUser.uid,
+            memberIds = listOf(currentUser.uid) + invitedFriendIds,
+            isActive = true
         )
         
-        val updated = _sessions.value.toMutableList()
-        updated.add(session)
-        _sessions.value = updated
-        _currentSession.value = session
-        
-        // Update friend statuses
-        invitedFriendIds.forEach { friendId ->
-            updateFriendStatus(friendId, FriendStatus.IN_SESSION)
+        return try {
+            db.collection("sessions").document(session.id).set(session).await()
+            updateMyLocation(GeoPoint(0.0, 0.0), 0f, FriendStatus.IN_SESSION)
+            session
+        } catch (e: Exception) {
+            null
         }
-        
-        saveSessions()
-        return session
     }
     
-    /**
-     * Join an existing session
-     */
-    fun joinSession(sessionId: String): Boolean {
-        val session = _sessions.value.find { it.id == sessionId } ?: return false
-        
-        if (!session.memberIds.contains(currentUserId)) {
-            session.memberIds.add(currentUserId)
-        }
-        
-        _currentSession.value = session
-        saveSessions()
-        return true
-    }
-    
-    /**
-     * Leave current session
-     */
-    fun leaveSession() {
-        _currentSession.value?.let { session ->
-            session.memberIds.remove(currentUserId)
+    suspend fun joinSession(sessionId: String): Boolean {
+        val currentUser = auth.currentUser ?: return false
+        return try {
+            val sessionRef = db.collection("sessions").document(sessionId)
+            val session = sessionRef.get().await().toObject<GroupSession>()
             
-            // If no members left, deactivate session
-            if (session.memberIds.isEmpty()) {
-                val updated = _sessions.value.map {
-                    if (it.id == session.id) it.copy(isActive = false) else it
-                }
-                _sessions.value = updated
+            if (session != null && !session.memberIds.contains(currentUser.uid)) {
+                val updatedMembers = session.memberIds.toMutableList()
+                updatedMembers.add(currentUser.uid)
+                sessionRef.update("memberIds", updatedMembers).await()
+                updateMyLocation(GeoPoint(0.0, 0.0), 0f, FriendStatus.IN_SESSION)
             }
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    suspend fun leaveSession() {
+        val currentUser = auth.currentUser ?: return
+        val session = _currentSession.value ?: return
+        
+        try {
+            val sessionRef = db.collection("sessions").document(session.id)
+            val updatedMembers = session.memberIds.filter { it != currentUser.uid }
             
+            if (updatedMembers.isEmpty()) {
+                sessionRef.update("isActive", false).await()
+            } else {
+                sessionRef.update("memberIds", updatedMembers).await()
+            }
+            updateMyLocation(GeoPoint(0.0, 0.0), 0f, FriendStatus.ONLINE)
             _currentSession.value = null
-            saveSessions()
-        }
+        } catch (e: Exception) { }
     }
-    
-    /**
-     * End session (creator only)
-     */
-    fun endSession(sessionId: String) {
-        val updated = _sessions.value.map { session ->
-            if (session.id == sessionId && session.creatorId == currentUserId) {
-                session.copy(isActive = false)
-            } else session
-        }
-        _sessions.value = updated
-        
-        if (_currentSession.value?.id == sessionId) {
-            _currentSession.value = null
-        }
-        
-        saveSessions()
+
+    suspend fun endSession(sessionId: String) {
+        val currentUser = auth.currentUser ?: return
+        try {
+            val sessionRef = db.collection("sessions").document(sessionId)
+            val session = sessionRef.get().await().toObject<GroupSession>()
+            if (session?.creatorId == currentUser.uid) {
+                sessionRef.update("isActive", false).await()
+            }
+        } catch (e: Exception) { }
     }
-    
-    /**
-     * Get active sessions I'm part of or invited to
-     */
-    fun getActiveSessions(): List<GroupSession> {
-        return _sessions.value.filter { it.isActive }
-    }
-    
-    /**
-     * Get friends by status
-     */
-    fun getFriendsByStatus(status: FriendStatus): List<Friend> {
-        return _friends.value.filter { it.status == status }
-    }
-    
-    /**
-     * Get online friends (online or riding)
-     */
-    fun getOnlineFriends(): List<Friend> {
-        return _friends.value.filter { 
-            it.status == FriendStatus.ONLINE || 
-            it.status == FriendStatus.RIDING ||
-            it.status == FriendStatus.IN_SESSION
-        }
-    }
-    
-    /**
-     * Invite friend to current session
-     */
+
     fun inviteFriendToSession(friendId: String) {
-        _currentSession.value?.let { session ->
-            if (!session.memberIds.contains(friendId)) {
-                session.memberIds.add(friendId)
-                updateFriendStatus(friendId, FriendStatus.IN_SESSION)
-                saveSessions()
-            }
+        val session = _currentSession.value ?: return
+        if (!session.memberIds.contains(friendId)) {
+            val updatedMembers = session.memberIds.toMutableList()
+            updatedMembers.add(friendId)
+            db.collection("sessions").document(session.id).update("memberIds", updatedMembers)
         }
     }
-    
-    private fun updateFriendStatus(friendId: String, status: FriendStatus) {
-        val updated = _friends.value.map { friend ->
-            if (friend.id == friendId) friend.copy(status = status) else friend
-        }
-        _friends.value = updated
-        saveFriends()
-    }
-    
-    private fun addDemoFriends() {
-        val demoFriends = listOf(
-            Friend(name = "Alice", status = FriendStatus.RIDING),
-            Friend(name = "Bob", status = FriendStatus.OFFLINE),
-            Friend(name = "Charlie", status = FriendStatus.ONLINE),
-            Friend(name = "Diana", status = FriendStatus.IN_SESSION)
-        )
-        _friends.value = demoFriends
-        saveFriends()
-    }
-    
-    private fun saveFriends() {
-        try {
-            val serializableFriends = _friends.value.map { friend ->
-                mapOf(
-                    "id" to friend.id,
-                    "name" to friend.name,
-                    "status" to friend.status.name,
-                    "lastKnownLat" to friend.lastKnownLocation?.latitude,
-                    "lastKnownLon" to friend.lastKnownLocation?.longitude,
-                    "currentSpeed" to friend.currentSpeed,
-                    "lastUpdated" to friend.lastUpdated
-                )
-            }
-            friendsFile.writeText(gson.toJson(serializableFriends))
+
+    /**
+     * Search for users by exact email or display name
+     */
+    suspend fun searchUsers(query: String): List<User> {
+        return try {
+            val emailQuery = db.collection("users")
+                .whereEqualTo("email", query)
+                .get().await()
+            
+            val nameQuery = db.collection("users")
+                .whereEqualTo("displayName", query)
+                .get().await()
+            
+            (emailQuery.toObjects(User::class.java) + nameQuery.toObjects(User::class.java))
+                .distinctBy { it.id }
+                .filter { it.id != auth.currentUser?.uid }
         } catch (e: Exception) {
-            e.printStackTrace()
+            emptyList()
         }
     }
-    
-    private fun loadFriends() {
+
+    /**
+     * Add a user to the current user's friend list
+     */
+    suspend fun addFriend(friendId: String) {
+        val currentUser = auth.currentUser ?: return
         try {
-            if (friendsFile.exists()) {
-                val json = friendsFile.readText()
-                val type = object : TypeToken<List<Map<String, Any?>>>() {}.type
-                val rawFriends: List<Map<String, Any?>> = gson.fromJson(json, type)
-                
-                _friends.value = rawFriends.map { raw ->
-                    val lat = raw["lastKnownLat"] as? Double
-                    val lon = raw["lastKnownLon"] as? Double
-                    
-                    Friend(
-                        id = raw["id"] as String,
-                        name = raw["name"] as String,
-                        status = FriendStatus.valueOf(raw["status"] as String),
-                        lastKnownLocation = if (lat != null && lon != null) GeoPoint(lat, lon) else null,
-                        currentSpeed = (raw["currentSpeed"] as? Number)?.toFloat() ?: 0f,
-                        lastUpdated = (raw["lastUpdated"] as? Number)?.toLong() ?: System.currentTimeMillis()
-                    )
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+            db.collection("users").document(currentUser.uid)
+                .update("friendIds", FieldValue.arrayUnion(friendId))
+                .await()
+        } catch (e: Exception) { }
     }
-    
-    private fun saveSessions() {
+
+    /**
+     * Remove a user from the current user's friend list
+     */
+    suspend fun removeFriend(friendId: String) {
+        val currentUser = auth.currentUser ?: return
         try {
-            val serializableSessions = _sessions.value.map { session ->
-                mapOf(
-                    "id" to session.id,
-                    "name" to session.name,
-                    "destLat" to session.destination.latitude,
-                    "destLon" to session.destination.longitude,
-                    "destinationName" to session.destinationName,
-                    "creatorId" to session.creatorId,
-                    "memberIds" to session.memberIds,
-                    "createdAt" to session.createdAt,
-                    "isActive" to session.isActive
-                )
-            }
-            sessionsFile.writeText(gson.toJson(serializableSessions))
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+            db.collection("users").document(currentUser.uid)
+                .update("friendIds", FieldValue.arrayRemove(friendId))
+                .await()
+        } catch (e: Exception) { }
     }
-    
-    private fun loadSessions() {
-        try {
-            if (sessionsFile.exists()) {
-                val json = sessionsFile.readText()
-                val type = object : TypeToken<List<Map<String, Any?>>>() {}.type
-                val rawSessions: List<Map<String, Any?>> = gson.fromJson(json, type)
-                
-                _sessions.value = rawSessions.map { raw ->
-                    @Suppress("UNCHECKED_CAST")
-                    GroupSession(
-                        id = raw["id"] as String,
-                        name = raw["name"] as String,
-                        destination = GeoPoint(
-                            raw["destLat"] as Double,
-                            raw["destLon"] as Double
-                        ),
-                        destinationName = raw["destinationName"] as String,
-                        creatorId = raw["creatorId"] as String,
-                        memberIds = (raw["memberIds"] as List<String>).toMutableList(),
-                        createdAt = (raw["createdAt"] as Number).toLong(),
-                        isActive = raw["isActive"] as Boolean
-                    )
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+
+    fun cleanup() {
+        friendsListener?.remove()
+        sessionsListener?.remove()
     }
 }

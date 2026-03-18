@@ -32,17 +32,21 @@ data class SavedRoute(
     val createdAt: Long = System.currentTimeMillis()
 )
 
-// Data classes for parsing Google Directions API response
-data class DirectionsResponse(val routes: List<Route>)
-data class Route(val overview_polyline: OverviewPolyline, val legs: List<Leg>)
-data class OverviewPolyline(val points: String)
-data class Leg(val distance: Distance, val duration: Duration)
-data class Distance(val value: Int)
-data class Duration(val value: Int)
+// Data classes for OSRM API response
+data class OsrmResponse(val code: String, val routes: List<OsrmRoute>)
+data class OsrmRoute(val geometry: String, val distance: Double, val duration: Double)
 
+// Data classes for Open-Elevation API
+data class ElevationResponse(val results: List<ElevationResult>)
+data class ElevationResult(val elevation: Double, val latitude: Double, val longitude: Double)
+
+// Data classes for OpenWeatherMap API
+data class WeatherResponse(val main: MainWeather, val weather: List<WeatherDescription>, val name: String)
+data class MainWeather(val temp: Double, val humidity: Int)
+data class WeatherDescription(val description: String, val icon: String)
 
 /**
- * Manages navigation, route calculation, and ETA
+ * Manages navigation, route calculation, ETA, elevation, and weather
  */
 class NavigationManager(private val context: Context) {
 
@@ -58,26 +62,33 @@ class NavigationManager(private val context: Context) {
     private val _etaSeconds = MutableStateFlow<Int?>(null)
     val etaSeconds: StateFlow<Int?> = _etaSeconds.asStateFlow()
 
+    private val _elevation = MutableStateFlow<Double?>(null)
+    val elevation: StateFlow<Double?> = _elevation.asStateFlow()
+
+    private val _weather = MutableStateFlow<WeatherResponse?>(null)
+    val weather: StateFlow<WeatherResponse?> = _weather.asStateFlow()
+
     private val _savedRoutes = MutableStateFlow<List<SavedRoute>>(emptyList())
     val savedRoutes: StateFlow<List<SavedRoute>> = _savedRoutes.asStateFlow()
 
     private var routeOverlay: Polyline? = null
     
-    private val apiKey = BuildConfig.MAPS_API_KEY
+    private val weatherApiKey = BuildConfig.WEATHER_API_KEY
 
     init {
         loadSavedRoutes()
     }
 
     /**
-     * Set a destination and calculate route from a routing API
+     * Set a destination and calculate route, elevation, and weather
      */
     fun setDestination(currentLocation: GeoPoint, destination: GeoPoint) {
         _destination.value = destination
         
-        // Launch a coroutine to fetch the route from the API
         CoroutineScope(Dispatchers.IO).launch {
             fetchAndApplyRoute(currentLocation, destination)
+            fetchElevation(destination)
+            fetchWeather(destination)
         }
     }
 
@@ -89,12 +100,25 @@ class NavigationManager(private val context: Context) {
         _currentRoute.value = emptyList()
         _distanceToDestination.value = 0.0
         _etaSeconds.value = null
+        _elevation.value = null
+        _weather.value = null
     }
 
     /**
-     * Update ETA based on current speed and remaining distance
+     * Update environmental data (elevation, weather) for current location
      */
-    fun updateETA(currentLocation: Location, currentSpeedKmh: Double) {
+    fun updateEnvironmentalData(location: Location) {
+        val point = GeoPoint(location.latitude, location.longitude)
+        CoroutineScope(Dispatchers.IO).launch {
+            fetchElevation(point)
+            fetchWeather(point)
+        }
+    }
+
+    /**
+     * Update ETA and current weather periodically
+     */
+    fun updateProgress(currentLocation: Location, currentSpeedKmh: Double) {
         val route = _currentRoute.value
         if (route.isEmpty() || destination.value == null) {
             _etaSeconds.value = null
@@ -108,8 +132,13 @@ class NavigationManager(private val context: Context) {
         _distanceToDestination.value = remainingDistance
 
         val speedMps = currentSpeedKmh * 1000 / 3600
-        if (speedMps > 1) { // Only update if moving
+        if (speedMps > 1) {
             _etaSeconds.value = (remainingDistance / speedMps).toInt()
+        }
+
+        // Periodically update elevation/weather for current position if needed
+        CoroutineScope(Dispatchers.IO).launch {
+            fetchElevation(GeoPoint(currentLocation.latitude, currentLocation.longitude))
         }
     }
 
@@ -117,12 +146,8 @@ class NavigationManager(private val context: Context) {
      * Draw the current route on the map
      */
     fun drawRouteOnMap(mapView: MapView) {
-        // Remove old route overlay
-        routeOverlay?.let {
-            mapView.overlays.remove(it)
-        }
+        routeOverlay?.let { mapView.overlays.remove(it) }
 
-        // Add new route overlay
         if (_currentRoute.value.isNotEmpty()) {
             val polyline = Polyline().apply {
                 setPoints(_currentRoute.value)
@@ -131,12 +156,12 @@ class NavigationManager(private val context: Context) {
             }
             mapView.overlays.add(polyline)
             routeOverlay = polyline
-            mapView.invalidate() // Refresh the map
+            mapView.invalidate()
         }
     }
 
     /**
-     * Save the current route to a file
+     * Save current route to local storage
      */
     fun saveCurrentRoute(routeName: String) {
         val route = _currentRoute.value
@@ -155,8 +180,83 @@ class NavigationManager(private val context: Context) {
     }
 
     /**
-     * Delete a saved route
+     * Fetches elevation from Open-Elevation API (Free)
      */
+    private fun fetchElevation(point: GeoPoint) {
+        val urlString = "https://api.open-elevation.com/api/v1/lookup?locations=${point.latitude},${point.longitude}"
+        
+        try {
+            val url = URL(urlString)
+            val connection = url.openConnection() as HttpURLConnection
+            val reader = InputStreamReader(connection.inputStream)
+            val response = Gson().fromJson(reader, ElevationResponse::class.java)
+            reader.close()
+            connection.disconnect()
+
+            if (response.results.isNotEmpty()) {
+                _elevation.value = response.results[0].elevation
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /**
+     * Fetches weather from OpenWeatherMap API
+     */
+    private fun fetchWeather(point: GeoPoint) {
+        if (weatherApiKey.isEmpty()) return
+
+        val urlString = "https://api.openweathermap.org/data/2.5/weather?" +
+                "lat=${point.latitude}&lon=${point.longitude}&" +
+                "appid=$weatherApiKey&units=metric"
+        
+        try {
+            val url = URL(urlString)
+            val connection = url.openConnection() as HttpURLConnection
+            val reader = InputStreamReader(connection.inputStream)
+            val response = Gson().fromJson(reader, WeatherResponse::class.java)
+            reader.close()
+            connection.disconnect()
+
+            _weather.value = response
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /**
+     * Fetches route from OSRM (Open Source Routing Machine) - Free, no API Key needed
+     */
+    private fun fetchAndApplyRoute(start: GeoPoint, end: GeoPoint) {
+        // OSRM expects coordinates in Lon,Lat format
+        val urlString = "https://router.project-osrm.org/route/v1/driving/" +
+                "${start.longitude},${start.latitude};${end.longitude},${end.latitude}" +
+                "?overview=full&geometries=polyline"
+
+        try {
+            val url = URL(urlString)
+            val connection = url.openConnection() as HttpURLConnection
+            connection.setRequestProperty("User-Agent", "ExpeditionApp")
+            
+            val reader = InputStreamReader(connection.inputStream)
+            val response = Gson().fromJson(reader, OsrmResponse::class.java)
+            reader.close()
+            connection.disconnect()
+
+            if (response.code == "Ok" && response.routes.isNotEmpty()) {
+                val route = response.routes[0]
+                _currentRoute.value = decodePolyline(route.geometry)
+                _distanceToDestination.value = route.distance
+                _etaSeconds.value = route.duration.toInt()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            clearNavigation()
+        }
+    }
+
+    // Helper methods for saving/loading routes
     fun deleteSavedRoute(routeId: String) {
         val updatedRoutes = _savedRoutes.value.filter { it.id != routeId }
         _savedRoutes.value = updatedRoutes
@@ -186,54 +286,7 @@ class NavigationManager(private val context: Context) {
         }
     }
 
-    /**
-     * Fetches route from Google Directions API and updates state
-     */
-    private fun fetchAndApplyRoute(start: GeoPoint, end: GeoPoint) {
-        val urlString = "https://maps.googleapis.com/maps/api/directions/json?" +
-                "origin=${start.latitude},${start.longitude}&" +
-                "destination=${end.latitude},${end.longitude}&" +
-                "key=$apiKey"
-
-        val url = URL(urlString)
-        val connection = url.openConnection() as HttpURLConnection
-        connection.requestMethod = "GET"
-
-        try {
-            val reader = InputStreamReader(connection.inputStream)
-            val response = Gson().fromJson(reader, DirectionsResponse::class.java)
-            reader.close()
-
-            if (response.routes.isNotEmpty()) {
-                val route = response.routes[0]
-                
-                // Decode polyline and update current route
-                _currentRoute.value = decodePolyline(route.overview_polyline.points)
-
-                // Update distance and ETA from the API response
-                val totalDistance = route.legs.sumOf { it.distance.value }.toDouble()
-                val totalDuration = route.legs.sumOf { it.duration.value }
-                _distanceToDestination.value = totalDistance
-                _etaSeconds.value = totalDuration
-
-            } else {
-                // Handle no route found
-                clearNavigation()
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            clearNavigation()
-        } finally {
-            connection.disconnect()
-        }
-    }
-
-    /**
-     * Decode polyline string from Google Maps API to a list of GeoPoints
-     *
-     * Courtesy of: https://stackoverflow.com/questions/39851243/android-ios-decode-google-maps-encoded-polyline-string
-     */
-    private fun decodePolyline(encoded: String): List<GeoPoint> {
+    private fun decodePolyline(encoded: String): List<GeoPoint> { 
         val poly = ArrayList<GeoPoint>()
         var index = 0
         val len = encoded.length
@@ -265,53 +318,32 @@ class NavigationManager(private val context: Context) {
             val p = GeoPoint(lat.toDouble() / 1E5, lng.toDouble() / 1E5)
             poly.add(p)
         }
-
         return poly
     }
-
-    /**
-     * Calculate total distance of a route in meters
-     */
-    private fun calculateTotalDistance(waypoints: List<GeoPoint>): Double {
-        var totalDistance = 0.0
-        for (i in 0 until waypoints.size - 1) {
-            totalDistance += waypoints[i].distanceToAsDouble(waypoints[i + 1])
-        }
-        return totalDistance
-    }
-
-    /**
-     * Calculate remaining distance from a point on the route
-     */
+    
     private fun calculateRemainingDistance(currentLocation: GeoPoint, route: List<GeoPoint>): Double {
-        // Find the closest point on the route
-        val closestPointIndex = route.indices.minByOrNull {
-            currentLocation.distanceToAsDouble(route[it])
-        } ?: return 0.0
-
-        // Calculate distance from the closest point to the end of the route
+        val closestPointIndex = route.indices.minByOrNull { currentLocation.distanceToAsDouble(route[it]) } ?: return 0.0
         var remainingDistance = 0.0
         for (i in closestPointIndex until route.size - 1) {
             remainingDistance += route[i].distanceToAsDouble(route[i + 1])
         }
-
         return remainingDistance
     }
 
     companion object {
         fun formatDistance(meters: Double?): String {
             if (meters == null) return "N/A"
-            return if (meters > 1000) {
-                String.format("%.1f km", meters / 1000)
-            } else {
-                String.format("%d m", meters.toInt())
-            }
+            return if (meters > 1000) String.format("%.1f km", meters / 1000) else String.format("%d m", meters.toInt())
         }
 
         fun formatETA(seconds: Int?): String {
             if (seconds == null) return "N/A"
-            val minutes = seconds / 60
-            return "$minutes min"
+            return "${seconds / 60} min"
+        }
+        
+        fun formatElevation(elevation: Double?): String {
+            if (elevation == null) return "N/A"
+            return "${elevation.toInt()} m"
         }
     }
 }

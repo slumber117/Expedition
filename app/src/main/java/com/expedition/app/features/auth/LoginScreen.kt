@@ -16,6 +16,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -29,7 +30,8 @@ fun LoginScreen(
     onLoginSuccess: (User) -> Unit,
     onNavigateToRegister: () -> Unit
 ) {
-    val authManager = remember { FirebaseAuthManager() }
+    val context = LocalContext.current
+    val authManager = remember { AuthManager(context) }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
 

@@ -20,6 +20,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -34,7 +35,8 @@ fun RegisterScreen(
     onRegisterSuccess: (User) -> Unit,
     onNavigateToLogin: () -> Unit
 ) {
-    val authManager = remember { FirebaseAuthManager() }
+    val context = LocalContext.current
+    val authManager = remember { AuthManager(context) }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     val scrollState = rememberScrollState()
@@ -200,14 +202,6 @@ fun RegisterScreen(
                                 onClick = { accountType = AccountType.SUPERVISOR },
                                 modifier = Modifier.fillMaxWidth()
                             )
-                            AccountTypeCard(
-                                title = "Admin",
-                                description = "Manage group rides and users",
-                                icon = Icons.Default.Settings,
-                                isSelected = accountType == AccountType.ADMIN,
-                                onClick = { accountType = AccountType.ADMIN },
-                                modifier = Modifier.fillMaxWidth()
-                            )
                         }
                     }
                 }
@@ -233,7 +227,8 @@ fun RegisterScreen(
                                     val result = authManager.register(
                                         email = email,
                                         password = password,
-                                        displayName = displayName
+                                        displayName = displayName,
+                                        accountType = accountType
                                     )
                                     isLoading = false
                                     when (result) {
