@@ -20,25 +20,27 @@ data class SearchResult(
 )
 
 /**
- * Manages place search using Nominatim (OpenStreetMap Geocoding)
+ * Manages place search using the Go Backend proxy.
  */
 class PlaceSearchManager {
+
+    // Point this to your load-balanced Go backend
+    private val BACKEND_SEARCH_URL = "http://10.0.2.2/api/v1/search" 
     
     /**
-     * Search for a place by query string
+     * Search for a place by query string via Go Backend
      */
     suspend fun search(query: String): List<SearchResult> = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext emptyList()
         
         try {
             val encodedQuery = URLEncoder.encode(query, "UTF-8")
-            val urlString = "https://nominatim.openstreetmap.org/search?format=json&q=$encodedQuery&limit=5"
+            val urlString = "$BACKEND_SEARCH_URL?q=$encodedQuery"
             val url = URL(urlString)
             
             val connection = url.openConnection() as HttpURLConnection
             connection.apply {
                 requestMethod = "GET"
-                setRequestProperty("User-Agent", "ExpeditionApp")
                 doInput = true
             }
             

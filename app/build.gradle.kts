@@ -16,12 +16,12 @@ if (localPropertiesFile.exists()) {
 
 android {
     namespace = "com.expedition.app"
-    compileSdk = 34
+    compileSdk = 35 // Targeting Android 15
 
     defaultConfig {
         applicationId = "com.expedition.app"
         minSdk = 24
-        targetSdk = 34
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0"
 
@@ -60,6 +60,11 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        jniLibs {
+            // This ensures native libraries are aligned at 16 KB boundaries
+            // and stored uncompressed in the APK for Android 15+ compatibility.
+            useLegacyPackaging = true
+        }
     }
 }
 
@@ -80,13 +85,13 @@ dependencies {
     implementation("com.google.firebase:firebase-auth-ktx")
     implementation("com.google.firebase:firebase-firestore-ktx")
     
-    // OSMDroid for Maps
+    // OSMDroid for Maps (Core)
     implementation("org.osmdroid:osmdroid-android:6.1.17")
     implementation("org.osmdroid:osmdroid-wms:6.1.17")
     implementation("org.osmdroid:osmdroid-mapsforge:6.1.17")
-    implementation("org.osmdroid:osmdroid-geopackage:6.1.17") {
-        exclude(group = "com.j256.ormlite", module = "ormlite-core")
-    }
+    
+    // Note: osmdroid-geopackage removed to resolve 16KB alignment issues with libsqliteX.so
+    // If you need GeoPackage support, use a version built for Android 15.
     
     // Gson for JSON serialization
     implementation("com.google.code.gson:gson:2.10.1")

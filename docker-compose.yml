@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  # Load Balancer
+  nginx:
+    image: nginx:latest
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - expedition-api
+
+  # Backend Instances (Replicated for load balancing)
+  expedition-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      - WEATHER_API_KEY=${WEATHER_API_KEY}
+      - PORT=8080
+    deploy:
+      replicas: 3 # Run 3 instances of the Go backend
+    restart: always
+
+networks:
+  default:
+    name: expedition-network

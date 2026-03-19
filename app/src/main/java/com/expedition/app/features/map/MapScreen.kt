@@ -62,6 +62,9 @@ fun MapScreen(
     val currentLocation by locationTracker.currentLocation.collectAsState()
     val speedKmh by locationTracker.speedKmh.collectAsState()
     val isOfflineMode by locationTracker.isOfflineMode.collectAsState()
+    val steps by locationTracker.steps.collectAsState()
+    val heading by locationTracker.estimatedHeading.collectAsState()
+    val baroAltitude by locationTracker.barometricAltitude.collectAsState()
     
     // Social state
     val friends by sessionManager.friends.collectAsState()
@@ -348,10 +351,12 @@ fun MapScreen(
             }
         }
         
-        // Persistent Dashboard (Speed & Elevation)
+        // Persistent Dashboard (Speed, Elevation, Steps, Heading)
         PersistentDashboard(
             speedKmh = speedKmh,
-            elevation = elevation,
+            elevation = baroAltitude ?: elevation,
+            steps = steps,
+            heading = heading,
             modifier = Modifier
                 .align(Alignment.TopStart)
                 .padding(top = 110.dp) // Below search bar
@@ -599,6 +604,8 @@ fun TravelModeButton(
 fun PersistentDashboard(
     speedKmh: Float,
     elevation: Double?,
+    steps: Int,
+    heading: Float,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -620,20 +627,39 @@ fun PersistentDashboard(
                 unit = "km/h",
                 label = "SPEED"
             )
-            Box(
-                modifier = Modifier
-                    .height(30.dp)
-                    .width(1.dp)
-                    .background(MaterialTheme.colorScheme.outlineVariant)
-            )
+            DividerVertical()
             DashboardItem(
                 icon = Icons.Default.Terrain,
                 value = if (elevation != null) "${elevation.toInt()}" else "--",
                 unit = "m",
                 label = "ELEVATION"
             )
+            DividerVertical()
+            DashboardItem(
+                icon = Icons.Default.DirectionsRun,
+                value = "$steps",
+                unit = "",
+                label = "STEPS"
+            )
+            DividerVertical()
+            DashboardItem(
+                icon = Icons.Default.Explore,
+                value = String.format("%.0f°", heading),
+                unit = "",
+                label = "HEADING"
+            )
         }
     }
+}
+
+@Composable
+fun DividerVertical() {
+    Box(
+        modifier = Modifier
+            .height(30.dp)
+            .width(1.dp)
+            .background(MaterialTheme.colorScheme.outlineVariant)
+    )
 }
 
 @Composable
@@ -660,19 +686,21 @@ fun DashboardItem(icon: ImageVector, value: String, unit: String, label: String)
                 fontWeight = FontWeight.Black,
                 color = MaterialTheme.colorScheme.onSurface
             )
-            Spacer(modifier = Modifier.width(2.dp))
-            Text(
-                text = unit,
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(bottom = 2.dp)
-            )
+            if (unit.isNotEmpty()) {
+                Spacer(modifier = Modifier.width(2.dp))
+                Text(
+                    text = unit,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 2.dp)
+                )
+            }
         }
     }
 }
 
 @Composable
-fun EnvironmentalInfoItem(icon: ImageVector, label: String, value: String) {
+fun EnvironmentalInfoItem(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, value: String) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Icon(icon, null, modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)

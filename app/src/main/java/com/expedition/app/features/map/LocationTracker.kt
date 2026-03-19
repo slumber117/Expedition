@@ -15,11 +15,11 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlin.math.sqrt
+import kotlin.math.*
 
 /**
  * Manages location tracking with GPS and sensor-based fallback for offline use.
- * When GPS is unavailable, uses accelerometer for velocity estimation.
+ * Utilizes Accelerometer, Gyroscope, and Barometer for dead reckoning and environmental awareness.
  */
 class LocationTracker(private val context: Context) : SensorEventListener, LocationListener {
 
@@ -34,6 +34,15 @@ class LocationTracker(private val context: Context) : SensorEventListener, Locat
     
     private val _isOfflineMode = MutableStateFlow(false)
     val isOfflineMode: StateFlow<Boolean> = _isOfflineMode.asStateFlow()
+
+    private val _steps = MutableStateFlow(0)
+    val steps: StateFlow<Int> = _steps.asStateFlow()
+
+    private val _estimatedHeading = MutableStateFlow(0f) // Degrees from North
+    val estimatedHeading: StateFlow<Float> = _estimatedHeading.asStateFlow()
+
+    private val _barometricAltitude = MutableStateFlow<Double?>(null)
+    val barometricAltitude: StateFlow<Double?> = _barometricAltitude.asStateFlow()
     
     // For sensor-based velocity estimation
     private var lastUpdateTime = 0L
@@ -44,6 +53,17 @@ class LocationTracker(private val context: Context) : SensorEventListener, Locat
     private val linearAcceleration = FloatArray(3)
     private val alpha = 0.8f // Low-pass filter constant
     
+    // For Heading estimation
+    private val magnetValues = FloatArray(3)
+    private val rotationMatrix = FloatArray(9)
+    private val orientationAngles = FloatArray(3)
+    private var lastGyroTime = 0L
+
+    // For Step Detection
+    private var accelPeakThreshold = 12.0f // m/s^2
+    private var stepCooldown = 300L // ms
+    private var lastStepTime = 0L
+
     private var lastKnownLocation: Location? = null
     private var isTracking = false
 
@@ -101,17 +121,21 @@ class LocationTracker(private val context: Context) : SensorEventListener, Locat
             }
         }
         
-        // Start accelerometer for offline fallback
         startSensorTracking()
     }
     
     private fun startSensorTracking() {
-        sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let { accelerometer ->
-            sensorManager.registerListener(
-                this,
-                accelerometer,
-                SensorManager.SENSOR_DELAY_GAME
-            )
+        val sensors = listOf(
+            Sensor.TYPE_ACCELEROMETER,
+            Sensor.TYPE_GYROSCOPE,
+            Sensor.TYPE_MAGNETIC_FIELD,
+            Sensor.TYPE_PRESSURE
+        )
+        
+        sensors.forEach { type ->
+            sensorManager.getDefaultSensor(type)?.let { sensor ->
+                sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_GAME)
+            }
         }
     }
     
@@ -120,10 +144,12 @@ class LocationTracker(private val context: Context) : SensorEventListener, Locat
         locationManager.removeUpdates(this)
         sensorManager.unregisterListener(this)
         
-        // Reset velocity
+        // Reset state
         velocityX = 0f
         velocityY = 0f
         velocityZ = 0f
+        lastUpdateTime = 0L
+        lastGyroTime = 0L
     }
     
     // LocationListener callbacks
@@ -134,10 +160,14 @@ class LocationTracker(private val context: Context) : SensorEventListener, Locat
         
         updateSpeedFromLocation(location)
         
-        // Reset sensor-based velocity when we get a real GPS fix
+        // Reset sensor-based velocity/dead reckoning offset when we get a real GPS fix
         velocityX = 0f
         velocityY = 0f
         velocityZ = 0f
+        
+        if (location.hasBearing()) {
+            _estimatedHeading.value = location.bearing
+        }
     }
     
     override fun onProviderEnabled(provider: String) {
@@ -145,68 +175,132 @@ class LocationTracker(private val context: Context) : SensorEventListener, Locat
     }
     
     override fun onProviderDisabled(provider: String) {
-        // Check if all providers are disabled
         val gpsEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
         val networkEnabled = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
-        
         if (!gpsEnabled && !networkEnabled) {
             _isOfflineMode.value = true
         }
     }
     
     @Deprecated("Deprecated in Java")
-    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {
-        // Required for older API levels
-    }
+    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
     
-    // SensorEventListener callbacks for offline velocity estimation
+    // SensorEventListener callbacks
     override fun onSensorChanged(event: SensorEvent?) {
         event ?: return
-        
-        if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
-            val currentTime = System.currentTimeMillis()
-            
-            // Apply low-pass filter to isolate gravity
-            gravity[0] = alpha * gravity[0] + (1 - alpha) * event.values[0]
-            gravity[1] = alpha * gravity[1] + (1 - alpha) * event.values[1]
-            gravity[2] = alpha * gravity[2] + (1 - alpha) * event.values[2]
-            
-            // Remove gravity to get linear acceleration
-            linearAcceleration[0] = event.values[0] - gravity[0]
-            linearAcceleration[1] = event.values[1] - gravity[1]
-            linearAcceleration[2] = event.values[2] - gravity[2]
-            
-            if (lastUpdateTime != 0L && _isOfflineMode.value) {
-                val deltaTime = (currentTime - lastUpdateTime) / 1000f // Convert to seconds
-                
-                // Integrate acceleration to get velocity (simplified)
-                // Apply damping to prevent drift
-                val damping = 0.98f
-                velocityX = (velocityX + linearAcceleration[0] * deltaTime) * damping
-                velocityY = (velocityY + linearAcceleration[1] * deltaTime) * damping
-                velocityZ = (velocityZ + linearAcceleration[2] * deltaTime) * damping
-                
-                // Calculate speed magnitude
-                val speedMs = sqrt(velocityX * velocityX + velocityY * velocityY + velocityZ * velocityZ)
-                
-                // Filter out noise (speeds below threshold are likely noise)
-                val filteredSpeedMs = if (speedMs < 0.5f) 0f else speedMs
-                
-                // Convert m/s to km/h
-                _speedKmh.value = filteredSpeedMs * 3.6f
+        val currentTime = System.currentTimeMillis()
+
+        when (event.sensor.type) {
+            Sensor.TYPE_ACCELEROMETER -> {
+                handleAccelerometer(event, currentTime)
             }
-            
-            lastUpdateTime = currentTime
+            Sensor.TYPE_GYROSCOPE -> {
+                handleGyroscope(event, currentTime)
+            }
+            Sensor.TYPE_MAGNETIC_FIELD -> {
+                System.arraycopy(event.values, 0, magnetValues, 0, 3)
+                updateOrientation()
+            }
+            Sensor.TYPE_PRESSURE -> {
+                handlePressure(event)
+            }
         }
     }
-    
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
-        // Not needed for our use case
+
+    private fun handleAccelerometer(event: SensorEvent, currentTime: Long) {
+        // Low-pass filter to isolate gravity
+        gravity[0] = alpha * gravity[0] + (1 - alpha) * event.values[0]
+        gravity[1] = alpha * gravity[1] + (1 - alpha) * event.values[1]
+        gravity[2] = alpha * gravity[2] + (1 - alpha) * event.values[2]
+        
+        // Remove gravity to get linear acceleration
+        linearAcceleration[0] = event.values[0] - gravity[0]
+        linearAcceleration[1] = event.values[1] - gravity[1]
+        linearAcceleration[2] = event.values[2] - gravity[2]
+
+        val mag = sqrt(event.values[0].pow(2) + event.values[1].pow(2) + event.values[2].pow(2))
+        
+        // Step detection
+        if (mag > accelPeakThreshold && currentTime - lastStepTime > stepCooldown) {
+            _steps.value += 1
+            lastStepTime = currentTime
+        }
+
+        // Dead Reckoning (Position Update)
+        if (lastUpdateTime != 0L && _isOfflineMode.value) {
+            val deltaTime = (currentTime - lastUpdateTime) / 1000f
+            
+            // Estimate speed from linear acceleration
+            val damping = 0.95f
+            velocityX = (velocityX + linearAcceleration[0] * deltaTime) * damping
+            velocityY = (velocityY + linearAcceleration[1] * deltaTime) * damping
+            velocityZ = (velocityZ + linearAcceleration[2] * deltaTime) * damping
+            
+            val speedMs = sqrt(velocityX * velocityX + velocityY * velocityY + velocityZ * velocityZ)
+            val filteredSpeedMs = if (speedMs < 0.3f) 0f else speedMs
+            _speedKmh.value = filteredSpeedMs * 3.6f
+
+            // Update virtual location based on speed and heading
+            if (filteredSpeedMs > 0) {
+                performDeadReckoningUpdate(filteredSpeedMs, deltaTime)
+            }
+        }
+        lastUpdateTime = currentTime
     }
+
+    private fun handleGyroscope(event: SensorEvent, currentTime: Long) {
+        if (lastGyroTime != 0L) {
+            val dt = (currentTime - lastGyroTime) / 1000f
+            // Simple integration of Z-axis rotation for heading refinement
+            val rotationZ = Math.toDegrees(event.values[2].toDouble()).toFloat() * dt
+            _estimatedHeading.value = (_estimatedHeading.value - rotationZ + 360) % 360
+        }
+        lastGyroTime = currentTime
+    }
+
+    private fun handlePressure(event: SensorEvent) {
+        val pressure = event.values[0]
+        // Standard formula for altitude from pressure: h = 44330 * (1 - (p/p0)^(1/5.255))
+        val altitude = 44330.0 * (1.0 - (pressure / 1013.25).pow(1.0 / 5.255))
+        _barometricAltitude.value = altitude
+    }
+
+    private fun updateOrientation() {
+        if (SensorManager.getRotationMatrix(rotationMatrix, null, gravity, magnetValues)) {
+            SensorManager.getOrientation(rotationMatrix, orientationAngles)
+            // azimuth is orientationAngles[0] in radians
+            val azimuthDegrees = Math.toDegrees(orientationAngles[0].toDouble()).toFloat()
+            // We use a complementary-like approach: trust GPS/Gyro, but drift-correct with Mag
+            val alphaMag = 0.05f // Low weight for magnetometer to avoid jitter
+            _estimatedHeading.value = (1 - alphaMag) * _estimatedHeading.value + alphaMag * ((azimuthDegrees + 360) % 360)
+        }
+    }
+
+    private fun performDeadReckoningUpdate(speedMs: Float, dt: Float) {
+        val currentLoc = _currentLocation.value ?: return
+        val headingRad = Math.toRadians(_estimatedHeading.value.toDouble())
+        
+        val distance = speedMs * dt
+        val earthRadius = 6371000.0 // meters
+
+        val deltaLat = (distance * cos(headingRad)) / earthRadius
+        val deltaLon = (distance * sin(headingRad)) / (earthRadius * cos(Math.toRadians(currentLoc.latitude)))
+
+        val newLocation = Location("dead_reckoning").apply {
+            latitude = currentLoc.latitude + Math.toDegrees(deltaLat)
+            longitude = currentLoc.longitude + Math.toDegrees(deltaLon)
+            time = System.currentTimeMillis()
+            speed = speedMs
+            bearing = _estimatedHeading.value
+            accuracy = 50f // Lower accuracy for estimated positions
+        }
+        _currentLocation.value = newLocation
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
     
     private fun updateSpeedFromLocation(location: Location) {
         if (location.hasSpeed()) {
-            // GPS provides speed in m/s, convert to km/h
             _speedKmh.value = location.speed * 3.6f
         }
     }

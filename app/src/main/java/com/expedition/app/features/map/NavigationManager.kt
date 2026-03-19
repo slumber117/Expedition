@@ -3,7 +3,6 @@ package com.expedition.app.features.map
 import android.content.Context
 import android.graphics.Color
 import android.location.Location
-import com.expedition.app.BuildConfig
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.io.File
@@ -41,23 +40,26 @@ data class SavedRoute(
     val createdAt: Long = System.currentTimeMillis()
 )
 
-// Data classes for OSRM API response
+// Data classes for Backend API responses
 data class OsrmResponse(val code: String, val routes: List<OsrmRoute>)
 data class OsrmRoute(val geometry: String, val distance: Double, val duration: Double)
 
-// Data classes for Open-Elevation API
 data class ElevationResponse(val results: List<ElevationResult>)
 data class ElevationResult(val elevation: Double, val latitude: Double, val longitude: Double)
 
-// Data classes for OpenWeatherMap API
 data class WeatherResponse(val main: MainWeather, val weather: List<WeatherDescription>, val name: String)
 data class MainWeather(val temp: Double, val humidity: Int)
 data class WeatherDescription(val description: String, val icon: String)
 
 /**
- * Manages navigation, route calculation, ETA, elevation, and weather
+ * Manages navigation, route calculation, ETA, elevation, and weather.
+ * Communication is now proxied through a Go backend to hide API keys and support load balancing.
  */
 class NavigationManager(private val context: Context) {
+
+    // Point this to your load-balanced Go backend
+    // For local development on emulator, use 10.0.2.2 or your machine's local IP
+    private val BACKEND_BASE_URL = "http://10.0.2.2/api/v1" 
 
     private val _destination = MutableStateFlow<GeoPoint?>(null)
     val destination: StateFlow<GeoPoint?> = _destination.asStateFlow()
@@ -84,16 +86,11 @@ class NavigationManager(private val context: Context) {
     val travelMode: StateFlow<TravelMode> = _travelMode.asStateFlow()
 
     private var routeOverlay: Polyline? = null
-    
-    private val weatherApiKey = BuildConfig.WEATHER_API_KEY
 
     init {
         loadSavedRoutes()
     }
 
-    /**
-     * Set a destination and calculate route, elevation, and weather
-     */
     fun setDestination(currentLocation: GeoPoint, destination: GeoPoint) {
         _destination.value = destination
         
@@ -104,9 +101,6 @@ class NavigationManager(private val context: Context) {
         }
     }
 
-    /**
-     * Clear current navigation
-     */
     fun clearNavigation() {
         _destination.value = null
         _currentRoute.value = emptyList()
@@ -116,9 +110,6 @@ class NavigationManager(private val context: Context) {
         _weather.value = null
     }
 
-    /**
-     * Update environmental data (elevation, weather) for current location
-     */
     fun updateEnvironmentalData(location: Location) {
         val point = GeoPoint(location.latitude, location.longitude)
         CoroutineScope(Dispatchers.IO).launch {
@@ -127,9 +118,6 @@ class NavigationManager(private val context: Context) {
         }
     }
 
-    /**
-     * Update ETA and current weather periodically
-     */
     fun updateProgress(currentLocation: Location, currentSpeedKmh: Double) {
         val route = _currentRoute.value
         if (route.isEmpty() || destination.value == null) {
@@ -145,39 +133,22 @@ class NavigationManager(private val context: Context) {
 
         val speedMps = currentSpeedKmh * 1000 / 3600
         
-        // Threshold: 0.5 m/s (~1.8 km/h). Below this, we assume the user is stationary.
-        // If not moving, we clear the ETA as per user request.
         if (speedMps > 0.5) {
             _etaSeconds.value = (remainingDistance / speedMps).toInt()
         } else {
             _etaSeconds.value = null
         }
 
-        // Periodically update elevation/weather for current position if needed
         CoroutineScope(Dispatchers.IO).launch {
             fetchElevation(GeoPoint(currentLocation.latitude, currentLocation.longitude))
         }
     }
 
-    /**
-     * Change travel mode and recalculate route if active
-     */
     fun setTravelMode(mode: TravelMode) {
         if (_travelMode.value == mode) return
         _travelMode.value = mode
-        
-        // Recalculate route if destination is set
-        val dest = _destination.value
-        if (dest != null) {
-            // We need current location to recalculate. 
-            // In a real app, we'd get it from LocationTracker. 
-            // For now, it will be recalculated on the next progress update or move.
-        }
     }
 
-    /**
-     * Draw the current route on the map
-     */
     fun drawRouteOnMap(mapView: MapView) {
         routeOverlay?.let { mapView.overlays.remove(it) }
 
@@ -193,9 +164,6 @@ class NavigationManager(private val context: Context) {
         }
     }
 
-    /**
-     * Save current route to local storage
-     */
     fun saveCurrentRoute(routeName: String) {
         val route = _currentRoute.value
         if (route.isEmpty() || routeName.isBlank()) return
@@ -213,10 +181,10 @@ class NavigationManager(private val context: Context) {
     }
 
     /**
-     * Fetches elevation from Open-Elevation API (Free)
+     * Fetches elevation via Go Backend (API Key hidden on server)
      */
     private fun fetchElevation(point: GeoPoint) {
-        val urlString = "https://api.open-elevation.com/api/v1/lookup?locations=${point.latitude},${point.longitude}"
+        val urlString = "$BACKEND_BASE_URL/elevation?lat=${point.latitude}&lon=${point.longitude}"
         
         try {
             val url = URL(urlString)
@@ -235,14 +203,10 @@ class NavigationManager(private val context: Context) {
     }
 
     /**
-     * Fetches weather from OpenWeatherMap API
+     * Fetches weather via Go Backend (API Key hidden on server)
      */
     private fun fetchWeather(point: GeoPoint) {
-        if (weatherApiKey.isEmpty()) return
-
-        val urlString = "https://api.openweathermap.org/data/2.5/weather?" +
-                "lat=${point.latitude}&lon=${point.longitude}&" +
-                "appid=$weatherApiKey&units=metric"
+        val urlString = "$BACKEND_BASE_URL/weather?lat=${point.latitude}&lon=${point.longitude}"
         
         try {
             val url = URL(urlString)
@@ -259,19 +223,17 @@ class NavigationManager(private val context: Context) {
     }
 
     /**
-     * Fetches route from OSRM (Open Source Routing Machine) - Free, no API Key needed
+     * Fetches route via Go Backend
      */
     private fun fetchAndApplyRoute(start: GeoPoint, end: GeoPoint) {
         val profile = _travelMode.value.osrmProfile
-        // OSRM expects coordinates in Lon,Lat format
-        val urlString = "https://router.project-osrm.org/route/v1/$profile/" +
-                "${start.longitude},${start.latitude};${end.longitude},${end.latitude}" +
-                "?overview=full&geometries=polyline"
+        val urlString = "$BACKEND_BASE_URL/route?profile=$profile" +
+                "&start=${start.longitude},${start.latitude}&end=${end.longitude},${end.latitude}"
 
         try {
             val url = URL(urlString)
             val connection = url.openConnection() as HttpURLConnection
-            connection.setRequestProperty("User-Agent", "ExpeditionApp")
+            connection.setRequestProperty("User-Agent", "ExpeditionApp/1.0")
             
             val reader = InputStreamReader(connection.inputStream)
             val response = Gson().fromJson(reader, OsrmResponse::class.java)
@@ -282,7 +244,6 @@ class NavigationManager(private val context: Context) {
                 val route = response.routes[0]
                 _currentRoute.value = decodePolyline(route.geometry)
                 _distanceToDestination.value = route.distance
-                // ETA is not calculated here but in updateProgress based on real speed
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -290,7 +251,6 @@ class NavigationManager(private val context: Context) {
         }
     }
 
-    // Helper methods for saving/loading routes
     fun deleteSavedRoute(routeId: String) {
         val updatedRoutes = _savedRoutes.value.filter { it.id != routeId }
         _savedRoutes.value = updatedRoutes
