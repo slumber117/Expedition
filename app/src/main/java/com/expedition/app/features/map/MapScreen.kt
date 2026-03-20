@@ -2,11 +2,13 @@ package com.expedition.app.features.map
 
 import android.Manifest
 import android.preference.PreferenceManager
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -22,13 +24,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.zIndex
 import androidx.core.content.ContextCompat
 import android.content.pm.PackageManager
+import com.expedition.app.features.auth.AuthManager
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.osmdroid.config.Configuration
@@ -44,6 +50,9 @@ import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 
 @Composable
 fun MapScreen(
+    navigationManager: NavigationManager,
+    searchManager: PlaceSearchManager,
+    sessionManager: GroupSessionManager,
     onNavigateToFriends: () -> Unit,
     onNavigateToSavedRoutes: () -> Unit,
     onLogout: () -> Unit
@@ -52,11 +61,8 @@ fun MapScreen(
     val coroutineScope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     
-    // Managers
-    val sessionManager = remember { GroupSessionManager(context) }
+    // We use the managers passed from the top level
     val locationTracker = remember { LocationTracker(context) }
-    val navigationManager = remember { NavigationManager(context) }
-    val searchManager = remember { PlaceSearchManager() }
     
     // Location state
     val currentLocation by locationTracker.currentLocation.collectAsState()
@@ -82,6 +88,8 @@ fun MapScreen(
     // UI state
     var searchQuery by remember { mutableStateOf("") }
     var searchResults by remember { mutableStateOf<List<SearchResult>>(emptyList()) }
+    var isSearching by remember { mutableStateOf(false) }
+    var searchErrorMessage by remember { mutableStateOf<String?>(null) }
     var showSaveRouteDialog by remember { mutableStateOf(false) }
     var routeName by remember { mutableStateOf("") }
     var destinationMarker by remember { mutableStateOf<Marker?>(null) }
@@ -164,10 +172,22 @@ fun MapScreen(
     // Search suggestions debounce
     LaunchedEffect(searchQuery) {
         if (searchQuery.length > 2) {
+            isSearching = true
+            searchErrorMessage = null
             delay(500) // Debounce
-            searchResults = searchManager.search(searchQuery)
+            try {
+                searchResults = searchManager.search(searchQuery)
+                if (searchResults.isEmpty()) {
+                    searchErrorMessage = "No results found for '$searchQuery'"
+                }
+            } catch (e: Exception) {
+                searchErrorMessage = "Network error. Check your connection or Backend URL."
+            } finally {
+                isSearching = false
+            }
         } else {
             searchResults = emptyList()
+            searchErrorMessage = null
         }
     }
 
@@ -204,7 +224,6 @@ fun MapScreen(
                                 GeoPoint(loc.latitude, loc.longitude),
                                 point
                             )
-                            navigationManager.drawRouteOnMap(this@apply)
                         }
                         invalidate()
                     }
@@ -217,7 +236,6 @@ fun MapScreen(
     
     // Update friend markers on map
     LaunchedEffect(friends) {
-        // Remove old markers not in the list anymore
         val currentFriendIds = friends.map { it.id }.toSet()
         val idsToRemove = friendMarkers.keys.filter { it !in currentFriendIds }
         idsToRemove.forEach { id ->
@@ -225,7 +243,6 @@ fun MapScreen(
             friendMarkers.remove(id)
         }
         
-        // Add or update markers
         friends.forEach { friend ->
             friend.lastKnownLocation?.let { point ->
                 val marker = friendMarkers.getOrPut(friend.id) {
@@ -269,12 +286,25 @@ fun MapScreen(
             modifier = Modifier.fillMaxSize()
         )
         
-        // Search Bar
+        // Persistent Dashboard - Moved to bottom layer of UI overlays
+        PersistentDashboard(
+            speedKmh = speedKmh,
+            elevation = baroAltitude ?: elevation,
+            steps = steps,
+            heading = heading,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(top = 110.dp)
+                .zIndex(0f) 
+        )
+
+        // Search UI - Moved to highest layer to overlap dashboard
         Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .padding(horizontal = 16.dp, vertical = 48.dp)
                 .fillMaxWidth()
+                .zIndex(1f) // Ensure search is always on top
         ) {
             Box(
                 modifier = Modifier
@@ -300,7 +330,9 @@ fun MapScreen(
                             unfocusedIndicatorColor = Color.Transparent,
                         )
                     )
-                    if (searchQuery.isNotEmpty()) {
+                    if (isSearching) {
+                        CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                    } else if (searchQuery.isNotEmpty()) {
                         IconButton(onClick = { searchQuery = "" }) {
                             Icon(Icons.Default.Close, null)
                         }
@@ -315,7 +347,7 @@ fun MapScreen(
                         .fillMaxWidth()
                         .padding(top = 4.dp),
                     shape = RoundedCornerShape(8.dp),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+                    elevation = CardDefaults.cardElevation(defaultElevation = 8.dp) // Higher elevation
                 ) {
                     Column {
                         searchResults.forEach { result ->
@@ -348,19 +380,24 @@ fun MapScreen(
                         }
                     }
                 }
+            } else if (searchErrorMessage != null) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f))
+                ) {
+                    Text(
+                        text = searchErrorMessage!!,
+                        modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                        textAlign = TextAlign.Center,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (searchErrorMessage!!.contains("error")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+                    )
+                }
             }
         }
-        
-        // Persistent Dashboard (Speed, Elevation, Steps, Heading)
-        PersistentDashboard(
-            speedKmh = speedKmh,
-            elevation = baroAltitude ?: elevation,
-            steps = steps,
-            heading = heading,
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(top = 110.dp) // Below search bar
-        )
         
         // Navigation Info Overlay
         if (destination != null) {
@@ -368,7 +405,8 @@ fun MapScreen(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(16.dp)
-                    .fillMaxWidth(),
+                    .fillMaxWidth()
+                    .zIndex(2f), // Top layer
                 shape = RoundedCornerShape(16.dp),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.95f))
             ) {
@@ -476,6 +514,7 @@ fun MapScreen(
             modifier = Modifier
                 .align(Alignment.CenterEnd)
                 .padding(16.dp)
+                .zIndex(2f)
         ) {
             FloatingActionButton(
                 onClick = onNavigateToFriends,
@@ -507,7 +546,8 @@ fun MapScreen(
             Surface(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
-                    .padding(top = 120.dp),
+                    .padding(top = 120.dp)
+                    .zIndex(3f),
                 color = MaterialTheme.colorScheme.error,
                 shape = RoundedCornerShape(16.dp)
             ) {
@@ -524,7 +564,10 @@ fun MapScreen(
         
         SnackbarHost(
             hostState = snackbarHostState,
-            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 100.dp)
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 100.dp)
+                .zIndex(4f)
         )
     }
     
@@ -543,7 +586,7 @@ fun MapScreen(
                 Button(onClick = {
                     if (currentRoute.isEmpty()) {
                         coroutineScope.launch {
-                            snackbarHostState.showSnackbar("Cannot save: No route calculated. Check your API key.")
+                            snackbarHostState.showSnackbar("Cannot save: No route calculated.")
                         }
                     } else {
                         navigationManager.saveCurrentRoute(routeName)
@@ -700,7 +743,7 @@ fun DashboardItem(icon: ImageVector, value: String, unit: String, label: String)
 }
 
 @Composable
-fun EnvironmentalInfoItem(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, value: String) {
+fun EnvironmentalInfoItem(icon: ImageVector, label: String, value: String) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Icon(icon, null, modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)

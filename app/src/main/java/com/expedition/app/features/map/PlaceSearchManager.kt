@@ -1,13 +1,12 @@
 package com.expedition.app.features.map
 
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.osmdroid.util.GeoPoint
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import org.json.JSONArray
-import org.json.JSONObject
 
 /**
  * Data class for search results
@@ -24,8 +23,7 @@ data class SearchResult(
  */
 class PlaceSearchManager {
 
-    // Point this to your load-balanced Go backend
-    private val BACKEND_SEARCH_URL = "http://10.0.2.2/api/v1/search" 
+    private val BACKEND_SEARCH_URL = "${BackendConfig.BASE_URL}/search" 
     
     /**
      * Search for a place by query string via Go Backend
@@ -36,37 +34,50 @@ class PlaceSearchManager {
         try {
             val encodedQuery = URLEncoder.encode(query, "UTF-8")
             val urlString = "$BACKEND_SEARCH_URL?q=$encodedQuery"
-            val url = URL(urlString)
+            Log.d("PlaceSearch", "Searching: $urlString")
             
+            val url = URL(urlString)
             val connection = url.openConnection() as HttpURLConnection
             connection.apply {
                 requestMethod = "GET"
+                setRequestProperty("User-Agent", "ExpeditionApp")
+                connectTimeout = 10000 // 10 second timeout
+                readTimeout = 10000
                 doInput = true
             }
             
             val responseCode = connection.responseCode
+            Log.d("PlaceSearch", "Response Code: $responseCode")
+            
             if (responseCode == HttpURLConnection.HTTP_OK) {
                 val response = connection.inputStream.bufferedReader().use { it.readText() }
+                Log.d("PlaceSearch", "Response: $response")
+                
                 val jsonArray = JSONArray(response)
                 val results = mutableListOf<SearchResult>()
                 
                 for (i in 0 until jsonArray.length()) {
                     val obj = jsonArray.getJSONObject(i)
+                    val lat = obj.optString("lat").toDoubleOrNull() ?: 0.0
+                    val lon = obj.optString("lon").toDoubleOrNull() ?: 0.0
+                    
                     results.add(
                         SearchResult(
-                            displayName = obj.getString("display_name"),
-                            latitude = obj.getDouble("lat"),
-                            longitude = obj.getDouble("lon"),
-                            type = obj.optString("type", "")
+                            displayName = obj.optString("display_name", "Unknown"),
+                            latitude = lat,
+                            longitude = lon,
+                            type = obj.optString("type", "location")
                         )
                     )
                 }
                 results
             } else {
+                val error = connection.errorStream?.bufferedReader()?.use { it.readText() }
+                Log.e("PlaceSearch", "Error Response: $error")
                 emptyList()
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e("PlaceSearch", "Exception during search", e)
             emptyList()
         }
     }

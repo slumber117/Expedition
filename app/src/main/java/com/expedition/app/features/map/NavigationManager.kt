@@ -53,13 +53,8 @@ data class WeatherDescription(val description: String, val icon: String)
 
 /**
  * Manages navigation, route calculation, ETA, elevation, and weather.
- * Communication is now proxied through a Go backend to hide API keys and support load balancing.
  */
 class NavigationManager(private val context: Context) {
-
-    // Point this to your load-balanced Go backend
-    // For local development on emulator, use 10.0.2.2 or your machine's local IP
-    private val BACKEND_BASE_URL = "http://10.0.2.2/api/v1" 
 
     private val _destination = MutableStateFlow<GeoPoint?>(null)
     val destination: StateFlow<GeoPoint?> = _destination.asStateFlow()
@@ -93,12 +88,17 @@ class NavigationManager(private val context: Context) {
 
     fun setDestination(currentLocation: GeoPoint, destination: GeoPoint) {
         _destination.value = destination
-        
         CoroutineScope(Dispatchers.IO).launch {
             fetchAndApplyRoute(currentLocation, destination)
             fetchElevation(destination)
             fetchWeather(destination)
         }
+    }
+
+    fun loadSavedRoute(route: SavedRoute, currentLocation: GeoPoint?) {
+        _currentRoute.value = route.waypoints
+        _destination.value = route.waypoints.lastOrNull()
+        _distanceToDestination.value = route.totalDistanceMeters
     }
 
     fun clearNavigation() {
@@ -132,7 +132,6 @@ class NavigationManager(private val context: Context) {
         _distanceToDestination.value = remainingDistance
 
         val speedMps = currentSpeedKmh * 1000 / 3600
-        
         if (speedMps > 0.5) {
             _etaSeconds.value = (remainingDistance / speedMps).toInt()
         } else {
@@ -180,12 +179,8 @@ class NavigationManager(private val context: Context) {
         saveRoutesToFile()
     }
 
-    /**
-     * Fetches elevation via Go Backend (API Key hidden on server)
-     */
     private fun fetchElevation(point: GeoPoint) {
-        val urlString = "$BACKEND_BASE_URL/elevation?lat=${point.latitude}&lon=${point.longitude}"
-        
+        val urlString = "${BackendConfig.BASE_URL}/elevation?lat=${point.latitude}&lon=${point.longitude}"
         try {
             val url = URL(urlString)
             val connection = url.openConnection() as HttpURLConnection
@@ -193,21 +188,14 @@ class NavigationManager(private val context: Context) {
             val response = Gson().fromJson(reader, ElevationResponse::class.java)
             reader.close()
             connection.disconnect()
-
             if (response.results.isNotEmpty()) {
                 _elevation.value = response.results[0].elevation
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (e: Exception) { e.printStackTrace() }
     }
 
-    /**
-     * Fetches weather via Go Backend (API Key hidden on server)
-     */
     private fun fetchWeather(point: GeoPoint) {
-        val urlString = "$BACKEND_BASE_URL/weather?lat=${point.latitude}&lon=${point.longitude}"
-        
+        val urlString = "${BackendConfig.BASE_URL}/weather?lat=${point.latitude}&lon=${point.longitude}"
         try {
             val url = URL(urlString)
             val connection = url.openConnection() as HttpURLConnection
@@ -215,31 +203,22 @@ class NavigationManager(private val context: Context) {
             val response = Gson().fromJson(reader, WeatherResponse::class.java)
             reader.close()
             connection.disconnect()
-
             _weather.value = response
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (e: Exception) { e.printStackTrace() }
     }
 
-    /**
-     * Fetches route via Go Backend
-     */
     private fun fetchAndApplyRoute(start: GeoPoint, end: GeoPoint) {
         val profile = _travelMode.value.osrmProfile
-        val urlString = "$BACKEND_BASE_URL/route?profile=$profile" +
+        val urlString = "${BackendConfig.BASE_URL}/route?profile=$profile" +
                 "&start=${start.longitude},${start.latitude}&end=${end.longitude},${end.latitude}"
-
         try {
             val url = URL(urlString)
             val connection = url.openConnection() as HttpURLConnection
             connection.setRequestProperty("User-Agent", "ExpeditionApp/1.0")
-            
             val reader = InputStreamReader(connection.inputStream)
             val response = Gson().fromJson(reader, OsrmResponse::class.java)
             reader.close()
             connection.disconnect()
-
             if (response.code == "Ok" && response.routes.isNotEmpty()) {
                 val route = response.routes[0]
                 _currentRoute.value = decodePolyline(route.geometry)
@@ -265,9 +244,7 @@ class NavigationManager(private val context: Context) {
                 val type = object : TypeToken<List<SavedRoute>>() {}.type
                 _savedRoutes.value = Gson().fromJson(json, type) ?: emptyList()
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (e: Exception) { e.printStackTrace() }
     }
 
     private fun saveRoutesToFile() {
@@ -275,9 +252,7 @@ class NavigationManager(private val context: Context) {
             val file = File(context.filesDir, "saved_routes.json")
             val json = Gson().toJson(_savedRoutes.value)
             file.writeText(json)
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (e: Exception) { e.printStackTrace() }
     }
 
     private fun decodePolyline(encoded: String): List<GeoPoint> { 
@@ -286,7 +261,6 @@ class NavigationManager(private val context: Context) {
         val len = encoded.length
         var lat = 0
         var lng = 0
-
         while (index < len) {
             var b: Int
             var shift = 0
@@ -298,7 +272,6 @@ class NavigationManager(private val context: Context) {
             } while (b >= 0x20)
             val dlat = if (result and 1 != 0) (result shr 1).inv() else result shr 1
             lat += dlat
-
             shift = 0
             result = 0
             do {
@@ -308,7 +281,6 @@ class NavigationManager(private val context: Context) {
             } while (b >= 0x20)
             val dlng = if (result and 1 != 0) (result shr 1).inv() else result shr 1
             lng += dlng
-
             val p = GeoPoint(lat.toDouble() / 1E5, lng.toDouble() / 1E5)
             poly.add(p)
         }
@@ -329,12 +301,10 @@ class NavigationManager(private val context: Context) {
             if (meters == null) return "N/A"
             return if (meters > 1000) String.format("%.1f km", meters / 1000) else String.format("%d m", meters.toInt())
         }
-
         fun formatETA(seconds: Int?): String {
             if (seconds == null) return "N/A"
             return "${seconds / 60} min"
         }
-        
         fun formatElevation(elevation: Double?): String {
             if (elevation == null) return "N/A"
             return "${elevation.toInt()} m"

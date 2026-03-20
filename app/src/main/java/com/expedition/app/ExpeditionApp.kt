@@ -1,14 +1,9 @@
 package com.expedition.app
 
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.List
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.compose.NavHost
@@ -18,14 +13,22 @@ import com.expedition.app.features.auth.AuthManager
 import com.expedition.app.features.auth.LoginScreen
 import com.expedition.app.features.auth.RegisterScreen
 import com.expedition.app.features.map.MapScreen
+import com.expedition.app.features.map.NavigationManager
 import com.expedition.app.features.map.SavedRoutesScreen
+import com.expedition.app.features.map.PlaceSearchManager
 import com.expedition.app.features.social.FriendsScreen
+import com.expedition.app.features.social.GroupSessionManager
 
 @Composable
 fun ExpeditionApp() {
     val context = LocalContext.current
     val navController = rememberNavController()
+    
+    // Shared Managers (Single instances for the whole app)
     val authManager = remember { AuthManager(context) }
+    val navigationManager = remember { NavigationManager(context) }
+    val searchManager = remember { PlaceSearchManager() }
+    val sessionManager = remember { GroupSessionManager(context) }
     
     val isLoggedIn by authManager.isLoggedIn.collectAsState()
     val startDestination = if (isLoggedIn) "map" else "login"
@@ -60,9 +63,13 @@ fun ExpeditionApp() {
             }
             composable("map") {
                 MapScreen(
+                    navigationManager = navigationManager,
+                    searchManager = searchManager,
+                    sessionManager = sessionManager,
                     onNavigateToFriends = { navController.navigate("friends") },
                     onNavigateToSavedRoutes = { navController.navigate("savedRoutes") },
                     onLogout = {
+                        authManager.logout()
                         navController.navigate("login") {
                             popUpTo("map") { inclusive = true }
                         }
@@ -73,15 +80,18 @@ fun ExpeditionApp() {
                 FriendsScreen(
                     onNavigateBack = { navController.popBackStack() },
                     onNavigateToDestination = { destination ->
-                        // The MapScreen will pick up the currentSession destination 
-                        // from GroupSessionManager, so we just need to go back
                         navController.popBackStack()
                     }
                 )
             }
             composable("savedRoutes") {
                 SavedRoutesScreen(
-                    onNavigateBack = { navController.popBackStack() }
+                    navigationManager = navigationManager,
+                    onNavigateBack = { navController.popBackStack() },
+                    onLoadRoute = { route ->
+                        navigationManager.loadSavedRoute(route, null)
+                        navController.popBackStack()
+                    }
                 )
             }
         }

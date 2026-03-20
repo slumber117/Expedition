@@ -10,9 +10,11 @@ import (
 	"net/url"
 	"os"
 	"strconv"
-	"time"
+	"strings" // Added for string manipulation
 
+	"cloud.google.com/go/firestore"
 	firebase "firebase.google.com/go/v4"
+	"firebase.google.com/go/v4/auth" // 🌟 ADD THIS for Firebase Auth
 	"github.com/gin-gonic/gin"
 	"github.com/mmcloughlin/geohash"
 	"google.golang.org/api/iterator"
@@ -22,16 +24,32 @@ import (
 // GPX Models for XML parsing
 type GPX struct {
 	XMLName xml.Name `xml:"gpx"`
-	Tracks  []Track  `xml:"trk"`
+	Tracks[]Track  `xml:"trk"`
+}
+
+type RouteWeatherRequest struct {
+	StartTimeUnix int64 `json:"start_time_unix"`
+	Waypoints[]struct {
+		Lat           float64 `json:"lat"`
+		Lon           float64 `json:"lon"`
+		TimeFromStart int     `json:"time_from_start_seconds"`
+	} `json:"waypoints"`
+}
+
+type WeatherWarning struct {
+	Lat     float64 `json:"lat"`
+	Lon     float64 `json:"lon"`
+	Warning string  `json:"warning"`
+	Time    string  `json:"expected_time"`
 }
 
 type Track struct {
 	Name     string         `xml:"name"`
-	Segments []TrackSegment `xml:"trkseg"`
+	Segments[]TrackSegment `xml:"trkseg"`
 }
 
 type TrackSegment struct {
-	Points []TrackPoint `xml:"trkpt"`
+	Points[]TrackPoint `xml:"trkpt"`
 }
 
 type TrackPoint struct {
@@ -51,28 +69,15 @@ type Trailhead struct {
 	Source      string  `json:"source"` // "internal" or "osm"
 }
 
-// Overpass API Response Models
-type OverpassResponse struct {
-	Elements []struct {
-		ID   int64   `json:"id"`
-		Lat  float64 `json:"lat"`
-		Lon  float64 `json:"lon"`
-		Tags struct {
-			Name        string `json:"name"`
-			Description string `json:"description"`
-		} `json:"tags"`
-	} `json:"elements"`
-}
-
 type Config struct {
 	WeatherAPIKey string
-	Port           string
+	Port          string
 }
 
 func main() {
 	config := Config{
 		WeatherAPIKey: os.Getenv("WEATHER_API_KEY"),
-		Port:           os.Getenv("PORT"),
+		Port:          os.Getenv("PORT"),
 	}
 
 	if config.Port == "" {
@@ -81,18 +86,37 @@ func main() {
 
 	// Initialize Firebase Admin SDK
 	ctx := context.Background()
-	opt := option.WithCredentialsFile("serviceAccountKey.json")
-	app, err := firebase.NewApp(ctx, nil, opt)
-	if err != nil {
-		log.Printf("error initializing firebase admin: %v (backend will continue without admin features)", err)
-	}
+	var firestoreClient *firestore.Client
+	var authClient *auth.Client // 🌟 NEW: Declare the Auth client
 
-	firestoreClient, err := app.Firestore(ctx)
-	if err != nil {
-		log.Printf("error getting Firestore client: %v", err)
+	// Handled case-insensitively in Dockerfile to be 'serviceAccountKey.json'
+	if _, err := os.Stat("serviceAccountKey.json"); err == nil {
+		opt := option.WithCredentialsFile("serviceAccountKey.json")
+		app, err := firebase.NewApp(ctx, nil, opt)
+		if err != nil {
+			log.Printf("error initializing firebase admin: %v", err)
+		} else {
+			// Initialize Firestore
+			client, err := app.Firestore(ctx)
+			if err != nil {
+				log.Printf("error getting Firestore client: %v", err)
+			} else {
+				log.Println("Firebase Admin SDK & Firestore initialized successfully")
+				firestoreClient = client
+				defer firestoreClient.Close()
+			}
+
+			// 🌟 NEW: Initialize Auth
+			aClient, err := app.Auth(ctx)
+			if err != nil {
+				log.Printf("error getting Auth client: %v", err)
+			} else {
+				log.Println("Firebase Auth initialized successfully")
+				authClient = aClient
+			}
+		}
 	} else {
-		log.Println("Firebase Admin SDK & Firestore initialized successfully")
-		defer firestoreClient.Close()
+		log.Println("serviceAccountKey.json not found - trailhead features requiring Firestore will be disabled")
 	}
 
 	r := gin.Default()
@@ -124,7 +148,7 @@ func main() {
 				Ele float64 `json:"ele,omitempty"`
 			}
 
-			var coordinates []Waypoint
+			var coordinates[]Waypoint
 			for _, trk := range gpx.Tracks {
 				for _, seg := range trk.Segments {
 					for _, pt := range seg.Points {
@@ -135,28 +159,83 @@ func main() {
 			c.JSON(http.StatusOK, coordinates)
 		})
 
+		// 🌟 PREMIUM FEATURE: Predictive Weather Avoidance (£5/month)
+		api.POST("/weather/predict-route", func(c *gin.Context) {
+			// CHECK PRO SUBSCRIPTION FIRST!
+			if !checkProSubscription(c, authClient, firestoreClient) {
+				return // Blocks the request if they aren't paying
+			}
+
+			// 1. Parse the route sent by the Kotlin app
+			var req RouteWeatherRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid route data"})
+				return
+			}
+
+			var warnings[]WeatherWarning
+
+			// 2. Loop through the waypoints
+			for _, wp := range req.Waypoints {
+				apiUrl := fmt.Sprintf("https://api.open-meteo.com/v1/forecast?latitude=%f&longitude=%f&hourly=precipitation,windspeed_10m", wp.Lat, wp.Lon)
+
+				resp, err := http.Get(apiUrl)
+				if err != nil {
+					continue
+				}
+
+				var weatherData struct {
+					Hourly struct {
+						Precipitation []float64 `json:"precipitation"`
+						Windspeed[]float64 `json:"windspeed_10m"`
+					} `json:"hourly"`
+				}
+				json.NewDecoder(resp.Body).Decode(&weatherData)
+				resp.Body.Close()
+
+				// Simplified Logic: Check if the 1st hour has rain or high winds
+				if len(weatherData.Hourly.Precipitation) > 0 && weatherData.Hourly.Precipitation[0] > 0.5 {
+					warnings = append(warnings, WeatherWarning{
+						Lat:     wp.Lat,
+						Lon:     wp.Lon,
+						Warning: "Heavy rain expected here when you arrive.",
+					})
+				}
+			}
+
+			// 3. Return the warnings to the Kotlin app to draw icons on the map
+			c.JSON(http.StatusOK, gin.H{
+				"route_safe": len(warnings) == 0,
+				"warnings":   warnings,
+			})
+		})
+
 		// 2. Trailhead Management (Hybrid: Firestore + OpenStreetMap)
 		api.GET("/trailheads/nearby", func(c *gin.Context) {
 			latStr, lonStr := c.Query("lat"), c.Query("lon")
 			lat, _ := strconv.ParseFloat(latStr, 64)
 			lon, _ := strconv.ParseFloat(lonStr, 64)
 
-			var results []Trailhead
+			var results[]Trailhead
 
-			// A. Query Internal Firestore Trailheads first
+			// A. Query Internal Firestore Trailheads
 			if firestoreClient != nil {
 				hash := geohash.Encode(lat, lon)
 				prefix := hash[:5] // ~5km radius
 				iter := firestoreClient.Collection("trailheads").
-					OrderBy("geohash", 0).
+					OrderBy("geohash", firestore.Asc).
 					StartAt(prefix).
 					EndAt(prefix + "~").
 					Documents(ctx)
 
 				for {
 					doc, err := iter.Next()
-					if err == iterator.Done { break }
-					if err != nil { break }
+					if err == iterator.Done {
+						break
+					}
+					if err != nil {
+						break
+					}
 					var th Trailhead
 					doc.DataTo(&th)
 					th.ID = doc.Ref.ID
@@ -165,9 +244,8 @@ func main() {
 				}
 			}
 
-			// B. Query Public Data from OpenStreetMap (Overpass API)
-			// This fills in the gaps where you don't have internal data yet
-			osmTrailheads, err := fetchOSMTrailheads(lat, lon, 5000) // 5km radius
+			// B. Query Public Data from OpenStreetMap
+			osmTrailheads, err := fetchOSMTrailheads(lat, lon, 5000)
 			if err == nil {
 				results = append(results, osmTrailheads...)
 			}
@@ -177,13 +255,51 @@ func main() {
 
 		// 3. Weather & Search Proxies (Hides Keys)
 		api.GET("/weather", func(c *gin.Context) {
+			lat, lon := c.Query("lat"), c.Query("lon")
 			apiUrl := fmt.Sprintf("https://api.openweathermap.org/data/2.5/weather?lat=%s&lon=%s&appid=%s&units=metric",
-				c.Query("lat"), c.Query("lon"), config.WeatherAPIKey)
+				lat, lon, config.WeatherAPIKey)
 			proxyRequest(apiUrl, c)
 		})
 
 		api.GET("/search", func(c *gin.Context) {
-			apiUrl := fmt.Sprintf("https://nominatim.openstreetmap.org/search?format=json&q=%s&limit=5", url.QueryEscape(c.Query("q")))
+			query := c.Query("q")
+			apiUrl := fmt.Sprintf("https://nominatim.openstreetmap.org/search?format=json&q=%s&limit=5", url.QueryEscape(query))
+			proxyRequest(apiUrl, c)
+		})
+
+		api.GET("/elevation", func(c *gin.Context) {
+			lat, lon := c.Query("lat"), c.Query("lon")
+			apiUrl := fmt.Sprintf("https://api.open-elevation.com/api/v1/lookup?locations=%s,%s", lat, lon)
+			proxyRequest(apiUrl, c)
+		})
+
+		api.GET("/route", func(c *gin.Context) {
+			profile := c.DefaultQuery("profile", "driving")
+			start := c.Query("start")
+			end := c.Query("end")
+
+			// 🌟 PREMIUM TIER: The "Twisty" Route (£5/month)
+			if profile == "twisty" {
+
+				// CHECK PRO SUBSCRIPTION FIRST!
+				if !checkProSubscription(c, authClient, firestoreClient) {
+					return // Blocks the request if they aren't paying
+				}
+
+				graphHopperKey := os.Getenv("GRAPHHOPPER_API_KEY")
+
+				// ch.disable=true & algorithm=alternative_route forces it to find scenic/curvy paths
+				apiUrl := fmt.Sprintf("https://graphhopper.com/api/1/route?point=%s&point=%s&vehicle=motorcycle&ch.disable=true&algorithm=alternative_route&key=%s",
+					start, end, graphHopperKey)
+
+				proxyRequest(apiUrl, c)
+				return // Important: stop here so we don't run the free tier code
+			}
+
+			// 🟢 FREE TIER: Standard A-to-B Routing (Fastest Route)
+			apiUrl := fmt.Sprintf("https://router.project-osrm.org/route/v1/%s/%s;%s?overview=full&geometries=polyline",
+				profile, start, end)
+
 			proxyRequest(apiUrl, c)
 		})
 	}
@@ -191,48 +307,77 @@ func main() {
 	r.Run(":" + config.Port)
 }
 
-// Helper to fetch trailheads from OpenStreetMap
+// =========================================================================
+// HELPER FUNCTIONS (Placed outside of main)
+// =========================================================================
+
+// checkProSubscription verifies the Firebase token and checks Firestore for Pro status
+func checkProSubscription(c *gin.Context, authClient *auth.Client, fsClient *firestore.Client) bool {
+	if authClient == nil || fsClient == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Firebase not fully configured on server"})
+		return false
+	}
+
+	// 1. Get the token from the header: "Authorization: Bearer <token>"
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing Authorization header"})
+		return false
+	}
+
+	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+
+	// 2. Verify the token with Firebase
+	token, err := authClient.VerifyIDToken(context.Background(), tokenString)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired token"})
+		return false
+	}
+
+	// 3. Check the user's document in Firestore (Assuming you have a 'users' collection)
+	doc, err := fsClient.Collection("users").Doc(token.UID).Get(context.Background())
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "User profile not found in database"})
+		return false
+	}
+
+	// 4. Check if they have a boolean field called "is_pro" set to true
+	isPro, err := doc.DataAt("is_pro")
+	if err != nil || isPro != true {
+		c.JSON(http.StatusPaymentRequired, gin.H{
+			"error":   "Upgrade required",
+			"message": "This is an Expedition Pro feature. Upgrade for £5/month.",
+		})
+		return false
+	}
+
+	// User is authenticated AND has a Pro subscription!
+	return true
+}
+
 func fetchOSMTrailheads(lat, lon float64, radius int) ([]Trailhead, error) {
-	// Overpass QL to find nodes tagged as trailhead near the coordinates
 	query := fmt.Sprintf(`[out:json];node["highway"="trailhead"](around:%d,%f,%f);out;`, radius, lat, lon)
 	overpassUrl := "https://overpass-api.de/api/interpreter?data=" + url.QueryEscape(query)
 
 	resp, err := http.Get(overpassUrl)
-	if err != nil { return nil, err }
-	defer resp.Body.Close()
-
-	var osmData OverpassResponse
-	if err := json.NewDecoder(resp.Body).Decode(&osmData); err != nil { return nil, err }
-
-	var trailheads []Trailhead
-	for _, el := range osmData.Elements {
-		name := el.Tags.Name
-		if name == "" { name = "Unnamed Trailhead" }
-
-		trailheads = append(trailheads, Trailhead{
-			ID:          fmt.Sprintf("osm_%d", el.ID),
-			Name:        name,
-			Lat:         el.Lat,
-			Lon:         el.Lon,
-			Description: el.Tags.Description,
-			Source:      "osm",
-		})
-	}
-	return trailheads, nil
-}
-
-// Helper to proxy requests and handle JSON responses
-func proxyRequest(apiUrl string, c *gin.Context) {
-	req, _ := http.NewRequest("GET", apiUrl, nil)
-	req.Header.Set("User-Agent", "ExpeditionBackend/1.0")
-	client := &http.Client{}
-	resp, err := client.Do(req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "upstream service failure"})
-		return
+		return nil, err
 	}
 	defer resp.Body.Close()
-	var data interface{}
-	json.NewDecoder(resp.Body).Decode(&data)
-	c.JSON(http.StatusOK, data)
-}
+
+	var osmData struct {
+		Elements[]struct {
+			ID   int64   `json:"id"`
+			Lat  float64 `json:"lat"`
+			Lon  float64 `json:"lon"`
+			Tags struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			} `json:"tags"`
+		} `json:"elements"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&osmData); err != nil {
+		return nil, err
+	}
+
+	var trailheads

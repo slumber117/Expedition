@@ -22,10 +22,11 @@ import java.util.*
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SavedRoutesScreen(
-    onNavigateBack: () -> Unit
+    navigationManager: NavigationManager,
+    onNavigateBack: () -> Unit,
+    onLoadRoute: (SavedRoute) -> Unit
 ) {
     val context = LocalContext.current
-    val navigationManager = remember { NavigationManager(context) }
     val offlineCacheManager = remember { OfflineCacheManager(context) }
     
     val savedRoutes by navigationManager.savedRoutes.collectAsState()
@@ -60,7 +61,6 @@ fun SavedRoutesScreen(
                 .padding(paddingValues)
                 .background(MaterialTheme.colorScheme.background)
         ) {
-            // Stats Header
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
@@ -105,6 +105,7 @@ fun SavedRoutesScreen(
                         RouteCard(
                             route = route,
                             isOffline = cachedRegions.any { it.name == route.name },
+                            onLoad = { onLoadRoute(route) },
                             onDelete = { 
                                 navigationManager.deleteSavedRoute(route.id)
                                 offlineCacheManager.deleteRegion(route.name)
@@ -121,6 +122,7 @@ fun SavedRoutesScreen(
 fun RouteCard(
     route: SavedRoute,
     isOffline: Boolean,
+    onLoad: () -> Unit,
     onDelete: () -> Unit
 ) {
     val date = remember(route.createdAt) {
@@ -186,12 +188,25 @@ fun RouteCard(
                 )
                 
                 Spacer(modifier = Modifier.weight(1f))
+
+                Button(
+                    onClick = onLoad,
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                    modifier = Modifier.height(32.dp)
+                ) {
+                    Icon(Icons.Default.Map, null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Load", style = MaterialTheme.typography.labelMedium)
+                }
+
+                Spacer(modifier = Modifier.width(8.dp))
                 
-                IconButton(onClick = onDelete) {
+                IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
                     Icon(
                         Icons.Default.DeleteOutline, 
                         contentDescription = "Delete",
-                        tint = MaterialTheme.colorScheme.error
+                        tint = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.size(20.dp)
                     )
                 }
             }

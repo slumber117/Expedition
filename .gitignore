@@ -15,9 +15,18 @@
 .cxx
 local.properties
 /app/build
+
 # Generated APKs
 *.apk
+
 # Logging
 build_log.txt
+
 # Large files
 *.hprof
+
+# Security - CRITICAL: Never push these files to a public repository
+**/serviceAccountKey.json
+**/serviceACcountKey.json
+**/env.yaml
+backend/expedition-backend
