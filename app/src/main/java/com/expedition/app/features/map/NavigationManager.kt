@@ -19,6 +19,7 @@ import kotlinx.coroutines.launch
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Polyline
+import kotlinx.coroutines.tasks.await
 
 /**
  * Supported travel modes for routing
@@ -26,7 +27,8 @@ import org.osmdroid.views.overlay.Polyline
 enum class TravelMode(val osrmProfile: String) {
     DRIVING("driving"),
     WALKING("foot"),
-    CYCLING("cycling")
+    CYCLING("cycling"),
+    TWISTY("twisty")
 }
 
 /**
@@ -41,8 +43,17 @@ data class SavedRoute(
 )
 
 // Data classes for Backend API responses
-data class OsrmResponse(val code: String, val routes: List<OsrmRoute>)
+data class OsrmResponse(val code: String, val routes: List<OsrmRoute>?)
 data class OsrmRoute(val geometry: String, val distance: Double, val duration: Double)
+
+data class GraphHopperResponse(val paths: List<GraphHopperPath>?)
+data class GraphHopperPath(val points: String, val distance: Double, val time: Long)
+
+data class RouteWeatherRequest(val start_time_unix: Long, val waypoints: List<Waypoint>)
+data class Waypoint(val lat: Double, val lon: Double, val time_from_start_seconds: Int)
+
+data class WeatherWarning(val lat: Double, val lon: Double, val warning: String, val expected_time: String)
+data class WeatherWarningsResponse(val route_safe: Boolean, val warnings: List<WeatherWarning>?)
 
 data class ElevationResponse(val results: List<ElevationResult>)
 data class ElevationResult(val elevation: Double, val latitude: Double, val longitude: Double)
@@ -73,6 +84,12 @@ class NavigationManager(private val context: Context) {
 
     private val _weather = MutableStateFlow<WeatherResponse?>(null)
     val weather: StateFlow<WeatherResponse?> = _weather.asStateFlow()
+
+    private val _weatherWarnings = MutableStateFlow<List<WeatherWarning>>(emptyList())
+    val weatherWarnings: StateFlow<List<WeatherWarning>> = _weatherWarnings.asStateFlow()
+
+    private val _requiresProUpgrade = MutableStateFlow(false)
+    val requiresProUpgrade: StateFlow<Boolean> = _requiresProUpgrade.asStateFlow()
 
     private val _savedRoutes = MutableStateFlow<List<SavedRoute>>(emptyList())
     val savedRoutes: StateFlow<List<SavedRoute>> = _savedRoutes.asStateFlow()
@@ -108,6 +125,11 @@ class NavigationManager(private val context: Context) {
         _etaSeconds.value = null
         _elevation.value = null
         _weather.value = null
+        _weatherWarnings.value = emptyList()
+    }
+
+    fun dismissUpgradeDialog() {
+        _requiresProUpgrade.value = false
     }
 
     fun updateEnvironmentalData(location: Location) {
@@ -212,21 +234,91 @@ class NavigationManager(private val context: Context) {
         val urlString = "${BackendConfig.BASE_URL}/route?profile=$profile" +
                 "&start=${start.longitude},${start.latitude}&end=${end.longitude},${end.latitude}"
         try {
+            val user = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser
+            val tokenTask = user?.getIdToken(false)
+            val token = if (tokenTask != null) com.google.android.gms.tasks.Tasks.await(tokenTask)?.token ?: "" else ""
+
             val url = URL(urlString)
             val connection = url.openConnection() as HttpURLConnection
             connection.setRequestProperty("User-Agent", "ExpeditionApp/1.0")
+            if (token.isNotEmpty()) {
+                connection.setRequestProperty("Authorization", "Bearer $token")
+            }
+            
+            val responseCode = connection.responseCode
+            if (responseCode == 402 || responseCode == 401) {
+                _requiresProUpgrade.value = true
+                clearNavigation()
+                return
+            }
+
             val reader = InputStreamReader(connection.inputStream)
-            val response = Gson().fromJson(reader, OsrmResponse::class.java)
+            if (profile == "twisty") {
+                val response = Gson().fromJson(reader, GraphHopperResponse::class.java)
+                if (response.paths != null && response.paths.isNotEmpty()) {
+                    val path = response.paths[0]
+                    _currentRoute.value = decodePolyline(path.points)
+                    _distanceToDestination.value = path.distance
+                    checkRouteWeather(_currentRoute.value, token)
+                }
+            } else {
+                val response = Gson().fromJson(reader, OsrmResponse::class.java)
+                if (response.code == "Ok" && response.routes != null && response.routes.isNotEmpty()) {
+                    val route = response.routes[0]
+                    _currentRoute.value = decodePolyline(route.geometry)
+                    _distanceToDestination.value = route.distance
+                    checkRouteWeather(_currentRoute.value, token)
+                }
+            }
             reader.close()
             connection.disconnect()
-            if (response.code == "Ok" && response.routes.isNotEmpty()) {
-                val route = response.routes[0]
-                _currentRoute.value = decodePolyline(route.geometry)
-                _distanceToDestination.value = route.distance
-            }
         } catch (e: Exception) {
             e.printStackTrace()
             clearNavigation()
+        }
+    }
+
+    private fun checkRouteWeather(route: List<GeoPoint>, token: String) {
+        if (route.isEmpty()) return
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                // sample every 10th point to avoid sending huge request
+                val waypoints = route.filterIndexed { index, _ -> index % 10 == 0 }.map {
+                    Waypoint(it.latitude, it.longitude, 0)
+                }
+                val request = RouteWeatherRequest(System.currentTimeMillis() / 1000, waypoints)
+                
+                val urlString = "${BackendConfig.BASE_URL}/weather/predict-route"
+                val url = URL(urlString)
+                val connection = url.openConnection() as HttpURLConnection
+                connection.requestMethod = "POST"
+                connection.setRequestProperty("Content-Type", "application/json")
+                if (token.isNotEmpty()) {
+                    connection.setRequestProperty("Authorization", "Bearer $token")
+                }
+                connection.doOutput = true
+                
+                val jsonRequest = Gson().toJson(request)
+                connection.outputStream.use { os ->
+                    os.write(jsonRequest.toByteArray())
+                }
+                
+                val responseCode = connection.responseCode
+                if (responseCode == 402) {
+                    _requiresProUpgrade.value = true
+                    return@launch
+                }
+                
+                if (responseCode == 200) {
+                    val reader = InputStreamReader(connection.inputStream)
+                    val response = Gson().fromJson(reader, WeatherWarningsResponse::class.java)
+                    reader.close()
+                    _weatherWarnings.value = response.warnings ?: emptyList()
+                }
+                connection.disconnect()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
     }
 

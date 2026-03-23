@@ -1,8 +1,10 @@
 package com.expedition.app.features.map
 
 import android.Manifest
+import android.content.Context
 import android.preference.PreferenceManager
 import android.util.Log
+import com.expedition.app.features.auth.AuthManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
@@ -34,7 +36,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
 import androidx.core.content.ContextCompat
 import android.content.pm.PackageManager
-import com.expedition.app.features.auth.AuthManager
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.osmdroid.config.Configuration
@@ -84,6 +85,8 @@ fun MapScreen(
     val elevation by navigationManager.elevation.collectAsState()
     val weather by navigationManager.weather.collectAsState()
     val travelMode by navigationManager.travelMode.collectAsState()
+    val weatherWarnings by navigationManager.weatherWarnings.collectAsState()
+    val requiresProUpgrade by navigationManager.requiresProUpgrade.collectAsState()
     
     // UI state
     var searchQuery by remember { mutableStateOf("") }
@@ -481,6 +484,20 @@ fun MapScreen(
                                 }
                             }
                         )
+                        Spacer(modifier = Modifier.width(16.dp))
+                        TravelModeButton(
+                            mode = TravelMode.TWISTY,
+                            isSelected = travelMode == TravelMode.TWISTY,
+                            icon = Icons.Default.Route,
+                            onClick = { 
+                                navigationManager.setTravelMode(TravelMode.TWISTY)
+                                currentLocation?.let { loc ->
+                                    destination?.let { dest ->
+                                        navigationManager.setDestination(GeoPoint(loc.latitude, loc.longitude), dest)
+                                    }
+                                }
+                            }
+                        )
                     }
 
                     Spacer(modifier = Modifier.height(12.dp))
@@ -539,6 +556,29 @@ fun MapScreen(
                 containerColor = MaterialTheme.colorScheme.primaryContainer
             ) {
                 Icon(Icons.Default.MyLocation, "My Location")
+            }
+        }
+        
+        // Weather Alerts Overlay
+        if (weatherWarnings.isNotEmpty()) {
+            Card(
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .padding(16.dp)
+                    .width(220.dp)
+                    .zIndex(2f),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Warning, null, tint = MaterialTheme.colorScheme.error)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Weather Alerts", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.error)
+                    }
+                    weatherWarnings.forEach { w ->
+                        Text(w.warning, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
+                    }
+                }
             }
         }
         
@@ -602,6 +642,38 @@ fun MapScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showSaveRouteDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (requiresProUpgrade) {
+        AlertDialog(
+            onDismissRequest = { navigationManager.dismissUpgradeDialog() },
+            title = { Text("Pro Feature Required") },
+            text = { Text("The Curvature Engine and Predictive Weather are Expedition Pro features.\n\nSince this is an active developer environment, upgrading is £0 (Role-based assignment). Would you like to provision a Pro account now?") },
+            confirmButton = {
+                Button(onClick = {
+                    coroutineScope.launch {
+                        val authManager = AuthManager(context)
+                        val result = authManager.upgradeToPro()
+                        navigationManager.dismissUpgradeDialog()
+                        when (result) {
+                            is com.expedition.app.features.auth.AuthResult.Success -> {
+                                snackbarHostState.showSnackbar("Successfully upgraded to Pro! Try calculating your Twisty route again.")
+                            }
+                            is com.expedition.app.features.auth.AuthResult.Error -> {
+                                snackbarHostState.showSnackbar(result.message)
+                            }
+                        }
+                    }
+                }) {
+                    Text("Upgrade for Free")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { navigationManager.dismissUpgradeDialog() }) {
                     Text("Cancel")
                 }
             }

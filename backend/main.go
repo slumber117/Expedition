@@ -341,12 +341,17 @@ func checkProSubscription(c *gin.Context, authClient *auth.Client, fsClient *fir
 		return false
 	}
 
-	// 4. Check if they have a boolean field called "is_pro" set to true
+	// 4. Check if they have a boolean field called "is_pro" set to true, OR if they are a DEVELOPER
 	isPro, err := doc.DataAt("is_pro")
-	if err != nil || isPro != true {
+	isProBool, _ := isPro.(bool)
+	
+	accountType, err2 := doc.DataAt("accountType")
+	accountTypeStr, _ := accountType.(string)
+
+	if (!isProBool && accountTypeStr != "DEVELOPER") {
 		c.JSON(http.StatusPaymentRequired, gin.H{
 			"error":   "Upgrade required",
-			"message": "This is an Expedition Pro feature. Upgrade for £5/month.",
+			"message": "This is a Pro feature. Ensure you have the Pro status or contact the Developer to unlock this.",
 		})
 		return false
 	}

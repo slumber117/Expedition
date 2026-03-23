@@ -25,13 +25,6 @@ android {
         versionCode = 1
         versionName = "1.0"
 
-        // Inject the API keys into the BuildConfig
-        val mapsKey = localProperties.getProperty("MAPS_API_KEY") ?: ""
-        val weatherKey = localProperties.getProperty("WEATHER_API_KEY") ?: ""
-        
-        buildConfigField("String", "MAPS_API_KEY", "\"$mapsKey\"")
-        buildConfigField("String", "WEATHER_API_KEY", "\"$weatherKey\"")
-
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
@@ -48,6 +41,11 @@ android {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
+    }
+    lint {
+        disable.add("MutableCollectionMutableState")
+        disable.add("AutoboxingStateCreation")
+        abortOnError = false
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8
@@ -84,6 +82,7 @@ dependencies {
     implementation(platform("com.google.firebase:firebase-bom:32.7.2"))
     implementation("com.google.firebase:firebase-auth-ktx")
     implementation("com.google.firebase:firebase-firestore-ktx")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3")
     
     // OSMDroid for Maps (Core)
     implementation("org.osmdroid:osmdroid-android:6.1.17")

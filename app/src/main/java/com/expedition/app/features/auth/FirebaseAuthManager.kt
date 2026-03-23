@@ -132,8 +132,28 @@ class FirebaseAuthManager {
             email = firebaseUser.email ?: "",
             displayName = firebaseUser.displayName ?: "",
             accountType = AccountType.REGULAR, // Default value
+            isPro = false,
             createdAt = firebaseUser.metadata?.creationTimestamp ?: 0,
             lastLoginAt = firebaseUser.metadata?.lastSignInTimestamp ?: 0
         )
+    }
+    
+    /**
+     * Upgrade current user to Pro for £0 cost by updating Firestore directly
+     */
+    suspend fun upgradeToPro(): AuthResult {
+        val current = _currentUser.value
+        if (current == null) {
+            return AuthResult.Error("Not logged in")
+        }
+        return try {
+            // Update Firestore is_pro field
+            db.collection("users").document(current.id).update("is_pro", true).await()
+            val updatedUser = current.copy(isPro = true)
+            _currentUser.value = updatedUser
+            AuthResult.Success(updatedUser)
+        } catch (e: Exception) {
+            AuthResult.Error(e.message ?: "Could not update Pro status")
+        }
     }
 }
