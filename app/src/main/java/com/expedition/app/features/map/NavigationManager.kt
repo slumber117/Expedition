@@ -52,8 +52,10 @@ data class GraphHopperPath(val points: String, val distance: Double, val time: L
 data class RouteWeatherRequest(val start_time_unix: Long, val waypoints: List<Waypoint>)
 data class Waypoint(val lat: Double, val lon: Double, val time_from_start_seconds: Int)
 
-data class WeatherWarning(val lat: Double, val lon: Double, val warning: String, val expected_time: String)
+data class WeatherWarning(val lat: Double, val lon: Double, val warning: String, val expected_time: String?, val severity: String?)
 data class WeatherWarningsResponse(val route_safe: Boolean, val warnings: List<WeatherWarning>?)
+
+data class RouteOption(val geometry: List<GeoPoint>, val distance: Double, val duration: Double)
 
 data class ElevationResponse(val results: List<ElevationResult>)
 data class ElevationResult(val elevation: Double, val latitude: Double, val longitude: Double)
@@ -87,6 +89,9 @@ class NavigationManager(private val context: Context) {
 
     private val _weatherWarnings = MutableStateFlow<List<WeatherWarning>>(emptyList())
     val weatherWarnings: StateFlow<List<WeatherWarning>> = _weatherWarnings.asStateFlow()
+
+    private val _routeColor = MutableStateFlow(Color.BLUE)
+    val routeColor: StateFlow<Int> = _routeColor.asStateFlow()
 
     private val _requiresProUpgrade = MutableStateFlow(false)
     val requiresProUpgrade: StateFlow<Boolean> = _requiresProUpgrade.asStateFlow()
@@ -176,7 +181,7 @@ class NavigationManager(private val context: Context) {
         if (_currentRoute.value.isNotEmpty()) {
             val polyline = Polyline().apply {
                 setPoints(_currentRoute.value)
-                color = Color.BLUE
+                color = _routeColor.value
                 width = 12f
             }
             mapView.overlays.add(polyline)
@@ -232,7 +237,7 @@ class NavigationManager(private val context: Context) {
     private fun fetchAndApplyRoute(start: GeoPoint, end: GeoPoint) {
         val profile = _travelMode.value.osrmProfile
         val urlString = "${BackendConfig.BASE_URL}/route?profile=$profile" +
-                "&start=${start.longitude},${start.latitude}&end=${end.longitude},${end.latitude}"
+                "&start=${start.longitude},${start.latitude}&end=${end.longitude},${end.latitude}&alternatives=true"
         try {
             val user = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser
             val tokenTask = user?.getIdToken(false)
@@ -253,73 +258,116 @@ class NavigationManager(private val context: Context) {
             }
 
             val reader = InputStreamReader(connection.inputStream)
+            val possibleRoutes = mutableListOf<RouteOption>()
+            
             if (profile == "twisty") {
                 val response = Gson().fromJson(reader, GraphHopperResponse::class.java)
-                if (response.paths != null && response.paths.isNotEmpty()) {
-                    val path = response.paths[0]
-                    _currentRoute.value = decodePolyline(path.points)
-                    _distanceToDestination.value = path.distance
-                    checkRouteWeather(_currentRoute.value, token)
+                if (response.paths != null) {
+                    response.paths.forEach { path ->
+                        possibleRoutes.add(RouteOption(decodePolyline(path.points), path.distance, path.time.toDouble()))
+                    }
                 }
             } else {
                 val response = Gson().fromJson(reader, OsrmResponse::class.java)
-                if (response.code == "Ok" && response.routes != null && response.routes.isNotEmpty()) {
-                    val route = response.routes[0]
-                    _currentRoute.value = decodePolyline(route.geometry)
-                    _distanceToDestination.value = route.distance
-                    checkRouteWeather(_currentRoute.value, token)
+                if (response.code == "Ok" && response.routes != null) {
+                    response.routes.forEach { route ->
+                        possibleRoutes.add(RouteOption(decodePolyline(route.geometry), route.distance, route.duration))
+                    }
                 }
             }
             reader.close()
             connection.disconnect()
+            
+            if (possibleRoutes.isNotEmpty()) {
+                evaluateRoutesWithWeather(possibleRoutes, token)
+            } else {
+                clearNavigation()
+            }
         } catch (e: Exception) {
             e.printStackTrace()
             clearNavigation()
         }
     }
 
-    private fun checkRouteWeather(route: List<GeoPoint>, token: String) {
-        if (route.isEmpty()) return
+    private fun evaluateRoutesWithWeather(routes: List<RouteOption>, token: String) {
         CoroutineScope(Dispatchers.IO).launch {
-            try {
-                // sample every 10th point to avoid sending huge request
-                val waypoints = route.filterIndexed { index, _ -> index % 10 == 0 }.map {
-                    Waypoint(it.latitude, it.longitude, 0)
-                }
-                val request = RouteWeatherRequest(System.currentTimeMillis() / 1000, waypoints)
-                
-                val urlString = "${BackendConfig.BASE_URL}/weather/predict-route"
-                val url = URL(urlString)
-                val connection = url.openConnection() as HttpURLConnection
-                connection.requestMethod = "POST"
-                connection.setRequestProperty("Content-Type", "application/json")
-                if (token.isNotEmpty()) {
-                    connection.setRequestProperty("Authorization", "Bearer $token")
-                }
-                connection.doOutput = true
-                
-                val jsonRequest = Gson().toJson(request)
-                connection.outputStream.use { os ->
-                    os.write(jsonRequest.toByteArray())
+            var bestRoute = routes[0]
+            var bestWarnings = emptyList<WeatherWarning>()
+            var bestSeverityLevel = 2 // 0: clear, 1: yellow, 2: red
+            
+            for (route in routes) {
+                val warnings = fetchWeatherForRoute(route.geometry, token)
+                val severityLevel = when {
+                    warnings.any { it.severity == "red" } -> 2
+                    warnings.any { it.severity == "yellow" } -> 1
+                    else -> 0
                 }
                 
-                val responseCode = connection.responseCode
-                if (responseCode == 402) {
-                    _requiresProUpgrade.value = true
-                    return@launch
+                if (severityLevel == 0) {
+                    bestRoute = route
+                    bestWarnings = warnings
+                    bestSeverityLevel = 0
+                    break // Found a perfect route
+                } else if (severityLevel < bestSeverityLevel || route == routes[0]) {
+                    bestRoute = route
+                    bestWarnings = warnings
+                    bestSeverityLevel = severityLevel
                 }
-                
-                if (responseCode == 200) {
-                    val reader = InputStreamReader(connection.inputStream)
-                    val response = Gson().fromJson(reader, WeatherWarningsResponse::class.java)
-                    reader.close()
-                    _weatherWarnings.value = response.warnings ?: emptyList()
-                }
-                connection.disconnect()
-            } catch (e: Exception) {
-                e.printStackTrace()
+            }
+            
+            _currentRoute.value = bestRoute.geometry
+            _distanceToDestination.value = bestRoute.distance
+            _weatherWarnings.value = bestWarnings
+            
+            _routeColor.value = when (bestSeverityLevel) {
+                2 -> Color.RED
+                1 -> Color.YELLOW
+                else -> Color.BLUE
             }
         }
+    }
+
+    private fun fetchWeatherForRoute(route: List<GeoPoint>, token: String): List<WeatherWarning> {
+        if (route.isEmpty()) return emptyList()
+        try {
+            val waypoints = route.filterIndexed { index, _ -> index % 10 == 0 }.map {
+                Waypoint(it.latitude, it.longitude, 0)
+            }
+            val request = RouteWeatherRequest(System.currentTimeMillis() / 1000, waypoints)
+            
+            val urlString = "${BackendConfig.BASE_URL}/weather/predict-route"
+            val url = URL(urlString)
+            val connection = url.openConnection() as HttpURLConnection
+            connection.requestMethod = "POST"
+            connection.setRequestProperty("Content-Type", "application/json")
+            if (token.isNotEmpty()) {
+                connection.setRequestProperty("Authorization", "Bearer $token")
+            }
+            connection.doOutput = true
+            
+            val jsonRequest = Gson().toJson(request)
+            connection.outputStream.use { os ->
+                os.write(jsonRequest.toByteArray())
+            }
+            
+            val responseCode = connection.responseCode
+            if (responseCode == 402) {
+                _requiresProUpgrade.value = true
+                return emptyList()
+            }
+            
+            if (responseCode == 200) {
+                val reader = InputStreamReader(connection.inputStream)
+                val response = Gson().fromJson(reader, WeatherWarningsResponse::class.java)
+                reader.close()
+                connection.disconnect()
+                return response.warnings ?: emptyList()
+            }
+            connection.disconnect()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return emptyList()
     }
 
     fun deleteSavedRoute(routeId: String) {

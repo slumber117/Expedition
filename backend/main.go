@@ -37,10 +37,11 @@ type RouteWeatherRequest struct {
 }
 
 type WeatherWarning struct {
-	Lat     float64 `json:"lat"`
-	Lon     float64 `json:"lon"`
-	Warning string  `json:"warning"`
-	Time    string  `json:"expected_time"`
+	Lat      float64 `json:"lat"`
+	Lon      float64 `json:"lon"`
+	Warning  string  `json:"warning"`
+	Time     string  `json:"expected_time"`
+	Severity string  `json:"severity"`
 }
 
 type Track struct {
@@ -194,12 +195,24 @@ func main() {
 				resp.Body.Close()
 
 				// Simplified Logic: Check if the 1st hour has rain or high winds
-				if len(weatherData.Hourly.Precipitation) > 0 && weatherData.Hourly.Precipitation[0] > 0.5 {
-					warnings = append(warnings, WeatherWarning{
-						Lat:     wp.Lat,
-						Lon:     wp.Lon,
-						Warning: "Heavy rain expected here when you arrive.",
-					})
+				if len(weatherData.Hourly.Precipitation) > 0 {
+					precip := weatherData.Hourly.Precipitation[0]
+					wind := weatherData.Hourly.Windspeed[0]
+					if precip > 2.0 || wind > 50.0 {
+						warnings = append(warnings, WeatherWarning{
+							Lat:      wp.Lat,
+							Lon:      wp.Lon,
+							Warning:  "Severe weather (Red Alert) expected here.",
+							Severity: "red",
+						})
+					} else if precip > 0.5 || wind > 30.0 {
+						warnings = append(warnings, WeatherWarning{
+							Lat:      wp.Lat,
+							Lon:      wp.Lon,
+							Warning:  "Moderate weather (Yellow Alert) expected here.",
+							Severity: "yellow",
+						})
+					}
 				}
 			}
 
@@ -277,6 +290,7 @@ func main() {
 			profile := c.DefaultQuery("profile", "driving")
 			start := c.Query("start")
 			end := c.Query("end")
+			alternatives := c.DefaultQuery("alternatives", "true")
 
 			// 🌟 PREMIUM TIER: The "Twisty" Route (£5/month)
 			if profile == "twisty" {
@@ -297,8 +311,8 @@ func main() {
 			}
 
 			// 🟢 FREE TIER: Standard A-to-B Routing (Fastest Route)
-			apiUrl := fmt.Sprintf("https://router.project-osrm.org/route/v1/%s/%s;%s?overview=full&geometries=polyline",
-				profile, start, end)
+			apiUrl := fmt.Sprintf("https://router.project-osrm.org/route/v1/%s/%s;%s?overview=full&geometries=polyline&alternatives=%s",
+				profile, start, end, alternatives)
 
 			proxyRequest(apiUrl, c)
 		})
