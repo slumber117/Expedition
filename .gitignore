@@ -28,5 +28,6 @@ build_log.txt
 # Security - CRITICAL: Never push these files to a public repository
 **/serviceAccountKey.json
 **/serviceACcountKey.json
+**/service*Key.json
 **/env.yaml
 backend/expedition-backend
