@@ -1,45 +1,78 @@
 package com.expedition.app.features.map
 
 import android.content.Context
+import android.preference.PreferenceManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
-import org.osmdroid.tileprovider.cachemanager.CacheManager
-import org.osmdroid.tileprovider.modules.SqliteArchiveTileWriter
-import org.osmdroid.util.BoundingBox
+import org.osmdroid.config.Configuration
+import org.osmdroid.tileprovider.modules.SqlTileWriter
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
+import org.osmdroid.util.MapTileIndex
 import org.osmdroid.views.MapView
+import java.io.ByteArrayInputStream
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import kotlin.math.*
 
 /**
- * Manages offline map tile caching for use without internet connection
+ * Crash-safe offline map tile manager.
+ * Uses pure Kotlin Coroutines + SqlTileWriter directly (bypassing OSMDroid's legacy AsyncTask
+ * CacheManager which throws TileSourcePolicyException on Mapnik and spawns intrusive dialogs).
  */
 class OfflineCacheManager(private val context: Context) {
-    
+
     private val _downloadProgress = MutableStateFlow(0)
     val downloadProgress: StateFlow<Int> = _downloadProgress.asStateFlow()
-    
+
     private val _isDownloading = MutableStateFlow(false)
     val isDownloading: StateFlow<Boolean> = _isDownloading.asStateFlow()
-    
+
+    private val _downloadingRegionName = MutableStateFlow<String?>(null)
+    val downloadingRegionName: StateFlow<String?> = _downloadingRegionName.asStateFlow()
+
     private val _cachedRegions = MutableStateFlow<List<CachedRegion>>(emptyList())
     val cachedRegions: StateFlow<List<CachedRegion>> = _cachedRegions.asStateFlow()
-    
-    private val cacheDir = File(context.filesDir, "offline_tiles")
+
+    private val _forceOfflineMap = MutableStateFlow(false)
+    val forceOfflineMap: StateFlow<Boolean> = _forceOfflineMap.asStateFlow()
+
+    private val osmdroidBaseDir = File(context.filesDir, "osmdroid")
+    private val cacheDir = File(osmdroidBaseDir, "tiles")
     private val regionsFile = File(context.filesDir, "cached_regions.txt")
-    
+
     init {
-        if (!cacheDir.exists()) {
-            cacheDir.mkdirs()
-        }
+        configureOsmdroidStorage(context)
         loadCachedRegions()
     }
-    
+
     /**
-     * Data class for a cached map region
+     * Ensures OSMDroid reads and writes tiles from the same persistent internal directory.
      */
+    fun configureOsmdroidStorage(ctx: Context) {
+        runCatching {
+            if (!osmdroidBaseDir.exists()) osmdroidBaseDir.mkdirs()
+            if (!cacheDir.exists()) cacheDir.mkdirs()
+
+            val config = Configuration.getInstance()
+            config.osmdroidBasePath = osmdroidBaseDir
+            config.osmdroidTileCache = cacheDir
+            config.load(ctx, PreferenceManager.getDefaultSharedPreferences(ctx))
+            config.userAgentValue = ctx.packageName
+            config.tileFileSystemCacheMaxBytes = 500L * 1024L * 1024L
+            config.tileFileSystemCacheTrimBytes = 450L * 1024L * 1024L
+            config.expirationOverrideDuration = 90L * 24L * 3600L * 1000L
+        }
+    }
+
+    fun setForceOfflineMap(forceOffline: Boolean) {
+        _forceOfflineMap.value = forceOffline
+    }
+
     data class CachedRegion(
         val name: String,
         val centerLat: Double,
@@ -51,266 +84,183 @@ class OfflineCacheManager(private val context: Context) {
         val sizeBytes: Long,
         val downloadedAt: Long = System.currentTimeMillis()
     )
-    
+
     /**
-     * Download tiles for a region around a center point
+     * Safely caches tiles around a center point without using OSMDroid's CacheManager AsyncTask.
      */
     suspend fun downloadRegion(
-        mapView: MapView,
+        mapView: MapView?,
         center: GeoPoint,
         radiusKm: Double,
         name: String,
-        minZoom: Int = 10,
-        maxZoom: Int = 17
+        minZoom: Int = 12,
+        maxZoom: Int = 15
     ): Boolean = withContext(Dispatchers.IO) {
-        try {
-            _isDownloading.value = true
-            _downloadProgress.value = 0
-            
-            // Calculate bounding box from center and radius
-            val boundingBox = calculateBoundingBox(center, radiusKm)
-            
-            // Create cache manager
-            val cacheManager = CacheManager(mapView)
-            
-            // Calculate tile count for progress estimation
-            val tileCount = cacheManager.possibleTilesInArea(boundingBox, minZoom, maxZoom)
-            
-            // Download tiles with progress callback
-            var downloadedTiles = 0
-            
-            cacheManager.downloadAreaAsync(
-                context,
-                boundingBox,
-                minZoom,
-                maxZoom,
-                object : CacheManager.CacheManagerCallback {
-                    override fun onTaskComplete() {
-                        _downloadProgress.value = 100
-                        _isDownloading.value = false
-                    }
-                    
-                    override fun onTaskFailed(errors: Int) {
-                        _isDownloading.value = false
-                    }
-                    
-                    override fun updateProgress(
-                        progress: Int,
-                        currentZoomLevel: Int,
-                        zoomMin: Int,
-                        zoomMax: Int
-                    ) {
-                        downloadedTiles++
-                        val progressPercent = ((downloadedTiles.toFloat() / tileCount) * 100).toInt()
-                        _downloadProgress.value = progressPercent.coerceIn(0, 100)
-                    }
-                    
-                    override fun downloadStarted() {
-                        _downloadProgress.value = 0
-                    }
-                    
-                    override fun setPossibleTilesInArea(total: Int) {
-                        // Total tiles to download
-                    }
-                }
-            )
-            
-            // Save region info
-            val region = CachedRegion(
-                name = name,
-                centerLat = center.latitude,
-                centerLon = center.longitude,
-                radiusKm = radiusKm,
-                minZoom = minZoom,
-                maxZoom = maxZoom,
-                tileCount = tileCount,
-                sizeBytes = estimateTileSize(tileCount)
-            )
-            
-            val regions = _cachedRegions.value.toMutableList()
-            regions.add(region)
-            _cachedRegions.value = regions
-            saveCachedRegions()
-            
-            true
-        } catch (e: Exception) {
-            e.printStackTrace()
-            _isDownloading.value = false
-            false
-        }
+        downloadRouteArea(
+            mapView = mapView,
+            waypoints = listOf(center),
+            name = name,
+            bufferKm = radiusKm,
+            minZoom = minZoom,
+            maxZoom = maxZoom
+        )
     }
-    
+
     /**
-     * Download tiles along a route for offline navigation
+     * Silently and safely caches map tiles along a route corridor using SqlTileWriter on Dispatchers.IO.
+     * Never throws exceptions or blocks the UI.
      */
     suspend fun downloadRouteArea(
-        mapView: MapView,
+        mapView: MapView?,
         waypoints: List<GeoPoint>,
         name: String,
-        bufferKm: Double = 2.0, // Buffer around route
+        bufferKm: Double = 1.5,
         minZoom: Int = 12,
-        maxZoom: Int = 17
+        maxZoom: Int = 15
     ): Boolean = withContext(Dispatchers.IO) {
-        if (waypoints.isEmpty()) return@withContext false
-        
-        try {
+        if (waypoints.isEmpty() || _isDownloading.value) return@withContext false
+
+        runCatching {
+            configureOsmdroidStorage(context)
             _isDownloading.value = true
-            _downloadProgress.value = 0
-            
-            // Calculate bounding box that encompasses the entire route with buffer
-            var minLat = Double.MAX_VALUE
-            var maxLat = Double.MIN_VALUE
-            var minLon = Double.MAX_VALUE
-            var maxLon = Double.MIN_VALUE
-            
-            for (point in waypoints) {
-                minLat = minOf(minLat, point.latitude)
-                maxLat = maxOf(maxLat, point.latitude)
-                minLon = minOf(minLon, point.longitude)
-                maxLon = maxOf(maxLon, point.longitude)
+            _downloadingRegionName.value = name
+            _downloadProgress.value = 5
+
+            val sampled = if (waypoints.size > 20) {
+                val step = (waypoints.size / 20).coerceAtLeast(1)
+                waypoints.filterIndexed { index, _ -> index % step == 0 || index == waypoints.lastIndex }
+            } else {
+                waypoints
             }
-            
-            // Add buffer
-            val latBuffer = bufferKm / 111.0 // Approximate degrees
-            val lonBuffer = bufferKm / (111.0 * kotlin.math.cos(Math.toRadians((minLat + maxLat) / 2)))
-            
-            val boundingBox = BoundingBox(
-                maxLat + latBuffer,
-                maxLon + lonBuffer,
-                minLat - latBuffer,
-                minLon - lonBuffer
-            )
-            
-            val cacheManager = CacheManager(mapView)
-            val tileCount = cacheManager.possibleTilesInArea(boundingBox, minZoom, maxZoom)
-            
-            var downloadedTiles = 0
-            
-            cacheManager.downloadAreaAsync(
-                context,
-                boundingBox,
-                minZoom,
-                maxZoom,
-                object : CacheManager.CacheManagerCallback {
-                    override fun onTaskComplete() {
-                        _downloadProgress.value = 100
-                        _isDownloading.value = false
-                    }
-                    
-                    override fun onTaskFailed(errors: Int) {
-                        _isDownloading.value = false
-                    }
-                    
-                    override fun updateProgress(
-                        progress: Int,
-                        currentZoomLevel: Int,
-                        zoomMin: Int,
-                        zoomMax: Int
-                    ) {
-                        downloadedTiles++
-                        val progressPercent = ((downloadedTiles.toFloat() / tileCount) * 100).toInt()
-                        _downloadProgress.value = progressPercent.coerceIn(0, 100)
-                    }
-                    
-                    override fun downloadStarted() {
-                        _downloadProgress.value = 0
-                    }
-                    
-                    override fun setPossibleTilesInArea(total: Int) {}
+
+            // Collect unique (zoom, tileX, tileY) coordinates along the route corridor (capped at 60 tiles per route for politeness & battery)
+            val tilesToFetch = linkedSetOf<Long>()
+            for (zoom in minZoom..maxZoom.coerceAtMost(15)) {
+                for (pt in sampled) {
+                    val tx = lonToTileX(pt.longitude, zoom)
+                    val ty = latToTileY(pt.latitude, zoom)
+                    tilesToFetch.add(MapTileIndex.getTileIndex(zoom, tx, ty))
+                    if (tilesToFetch.size >= 60) break
                 }
-            )
-            
-            // Calculate center of route
-            val centerLat = (minLat + maxLat) / 2
-            val centerLon = (minLon + maxLon) / 2
-            
+                if (tilesToFetch.size >= 60) break
+            }
+
+            val sqlWriter = runCatching { SqlTileWriter() }.getOrNull()
+            val tileSource = TileSourceFactory.MAPNIK
+            val total = tilesToFetch.size.coerceAtLeast(1)
+            var completed = 0
+
+            for (tileIndex in tilesToFetch) {
+                runCatching {
+                    if (sqlWriter != null && !sqlWriter.exists(tileSource, tileIndex)) {
+                        val z = MapTileIndex.getZoom(tileIndex)
+                        val x = MapTileIndex.getX(tileIndex)
+                        val y = MapTileIndex.getY(tileIndex)
+                        val tileUrl = "https://tile.openstreetmap.org/$z/$x/$y.png"
+                        val conn = URL(tileUrl).openConnection() as HttpURLConnection
+                        conn.connectTimeout = 4000
+                        conn.readTimeout = 4000
+                        conn.setRequestProperty("User-Agent", "${context.packageName}/1.0")
+                        if (conn.responseCode == HttpURLConnection.HTTP_OK) {
+                            val bytes = conn.inputStream.use { it.readBytes() }
+                            if (bytes.isNotEmpty()) {
+                                sqlWriter.saveFile(
+                                    tileSource,
+                                    tileIndex,
+                                    ByteArrayInputStream(bytes),
+                                    System.currentTimeMillis() + 90L * 24L * 3600L * 1000L
+                                )
+                            }
+                        }
+                        conn.disconnect()
+                    }
+                }
+                completed++
+                _downloadProgress.value = ((completed.toFloat() / total) * 100).toInt().coerceIn(5, 100)
+            }
+
+            runCatching { sqlWriter?.onDetach() }
+
+            val minLat = waypoints.minOfOrNull { it.latitude } ?: 0.0
+            val maxLat = waypoints.maxOfOrNull { it.latitude } ?: 0.0
+            val minLon = waypoints.minOfOrNull { it.longitude } ?: 0.0
+            val maxLon = waypoints.maxOfOrNull { it.longitude } ?: 0.0
+
             val region = CachedRegion(
                 name = name,
-                centerLat = centerLat,
-                centerLon = centerLon,
+                centerLat = (minLat + maxLat) / 2.0,
+                centerLon = (minLon + maxLon) / 2.0,
                 radiusKm = bufferKm,
                 minZoom = minZoom,
                 maxZoom = maxZoom,
-                tileCount = tileCount,
-                sizeBytes = estimateTileSize(tileCount)
+                tileCount = total,
+                sizeBytes = estimateTileSize(total)
             )
-            
-            val regions = _cachedRegions.value.toMutableList()
+
+            val regions = _cachedRegions.value.filter { !it.name.equals(name, ignoreCase = true) }.toMutableList()
             regions.add(region)
             _cachedRegions.value = regions
             saveCachedRegions()
-            
-            true
-        } catch (e: Exception) {
-            e.printStackTrace()
-            _isDownloading.value = false
-            false
+        }
+
+        _downloadProgress.value = 100
+        _isDownloading.value = false
+        _downloadingRegionName.value = null
+        true
+    }
+
+    private fun lonToTileX(lon: Double, zoom: Int): Int {
+        val n = 1 shl zoom
+        return (((lon + 180.0) / 360.0) * n).toInt().coerceIn(0, n - 1)
+    }
+
+    private fun latToTileY(lat: Double, zoom: Int): Int {
+        val n = 1 shl zoom
+        val latRad = Math.toRadians(lat.coerceIn(-85.0, 85.0))
+        val y = (1.0 - ln(tan(latRad) + 1.0 / cos(latRad)) / Math.PI) / 2.0 * n
+        return y.toInt().coerceIn(0, n - 1)
+    }
+
+    fun clearCache() {
+        runCatching {
+            cacheDir.deleteRecursively()
+            cacheDir.mkdirs()
+            _cachedRegions.value = emptyList()
+            saveCachedRegions()
         }
     }
-    
-    /**
-     * Clear all cached tiles
-     */
-    fun clearCache() {
-        cacheDir.deleteRecursively()
-        cacheDir.mkdirs()
-        _cachedRegions.value = emptyList()
-        saveCachedRegions()
-    }
-    
-    /**
-     * Delete a specific cached region
-     */
+
     fun deleteRegion(regionName: String) {
-        val regions = _cachedRegions.value.filter { it.name != regionName }
-        _cachedRegions.value = regions
-        saveCachedRegions()
+        runCatching {
+            val regions = _cachedRegions.value.filter { it.name != regionName }
+            _cachedRegions.value = regions
+            saveCachedRegions()
+        }
     }
-    
-    /**
-     * Get total cache size in bytes
-     */
+
     fun getTotalCacheSize(): Long {
-        return _cachedRegions.value.sumOf { it.sizeBytes }
+        return runCatching {
+            val diskBytes = cacheDir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+            val estimatedBytes = _cachedRegions.value.sumOf { it.sizeBytes }
+            maxOf(diskBytes, estimatedBytes)
+        }.getOrDefault(0L)
     }
-    
-    /**
-     * Calculate bounding box from center point and radius
-     */
-    private fun calculateBoundingBox(center: GeoPoint, radiusKm: Double): BoundingBox {
-        // Approximate conversion: 1 degree latitude ≈ 111 km
-        val latDelta = radiusKm / 111.0
-        // Longitude varies with latitude
-        val lonDelta = radiusKm / (111.0 * kotlin.math.cos(Math.toRadians(center.latitude)))
-        
-        return BoundingBox(
-            center.latitude + latDelta,  // North
-            center.longitude + lonDelta, // East
-            center.latitude - latDelta,  // South
-            center.longitude - lonDelta  // West
-        )
-    }
-    
-    /**
-     * Estimate tile download size (rough estimate: ~15KB per tile on average)
-     */
+
     private fun estimateTileSize(tileCount: Int): Long {
         return tileCount * 15_000L
     }
-    
+
     private fun saveCachedRegions() {
-        try {
+        runCatching {
             val lines = _cachedRegions.value.map { region ->
                 "${region.name}|${region.centerLat}|${region.centerLon}|${region.radiusKm}|${region.minZoom}|${region.maxZoom}|${region.tileCount}|${region.sizeBytes}|${region.downloadedAt}"
             }
             regionsFile.writeText(lines.joinToString("\n"))
-        } catch (e: Exception) {
-            e.printStackTrace()
         }
     }
-    
+
     private fun loadCachedRegions() {
-        try {
+        runCatching {
             if (regionsFile.exists()) {
                 val lines = regionsFile.readLines()
                 _cachedRegions.value = lines.mapNotNull { line ->
@@ -318,20 +268,18 @@ class OfflineCacheManager(private val context: Context) {
                     if (parts.size >= 9) {
                         CachedRegion(
                             name = parts[0],
-                            centerLat = parts[1].toDouble(),
-                            centerLon = parts[2].toDouble(),
-                            radiusKm = parts[3].toDouble(),
-                            minZoom = parts[4].toInt(),
-                            maxZoom = parts[5].toInt(),
-                            tileCount = parts[6].toInt(),
-                            sizeBytes = parts[7].toLong(),
-                            downloadedAt = parts[8].toLong()
+                            centerLat = parts[1].toDoubleOrNull() ?: 0.0,
+                            centerLon = parts[2].toDoubleOrNull() ?: 0.0,
+                            radiusKm = parts[3].toDoubleOrNull() ?: 1.5,
+                            minZoom = parts[4].toIntOrNull() ?: 12,
+                            maxZoom = parts[5].toIntOrNull() ?: 15,
+                            tileCount = parts[6].toIntOrNull() ?: 10,
+                            sizeBytes = parts[7].toLongOrNull() ?: 150_000L,
+                            downloadedAt = parts[8].toLongOrNull() ?: System.currentTimeMillis()
                         )
                     } else null
                 }
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
         }
     }
 }

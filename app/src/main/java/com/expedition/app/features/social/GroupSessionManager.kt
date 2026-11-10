@@ -6,11 +6,14 @@ import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.firestore.SetOptions
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.firestore.ktx.toObject
 import com.google.firebase.ktx.Firebase
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -66,7 +69,7 @@ class GroupSessionManager(private val context: Context) {
     
     private val db = Firebase.firestore
     private val auth = FirebaseAuth.getInstance()
-    private val scope = CoroutineScope(Dispatchers.Main)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main + CoroutineExceptionHandler { _, _ -> })
     
     private val _friends = MutableStateFlow<List<Friend>>(emptyList())
     val friends: StateFlow<List<Friend>> = _friends.asStateFlow()
@@ -76,6 +79,9 @@ class GroupSessionManager(private val context: Context) {
     
     private val _currentSession = MutableStateFlow<GroupSession?>(null)
     val currentSession: StateFlow<GroupSession?> = _currentSession.asStateFlow()
+
+    private val _activePttBeacon = MutableStateFlow<String?>(null)
+    val activePttBeacon: StateFlow<String?> = _activePttBeacon.asStateFlow()
     
     private var friendsListener: ListenerRegistration? = null
     private var sessionsListener: ListenerRegistration? = null
@@ -83,6 +89,28 @@ class GroupSessionManager(private val context: Context) {
     init {
         observeFriends()
         observeSessions()
+    }
+
+    fun sendPttVoiceBeacon(message: String) {
+        val session = _currentSession.value ?: return
+        val currentUserId = auth.currentUser?.uid ?: "rider"
+        scope.launch {
+            try {
+                db.collection("sessions").document(session.id).update(
+                    mapOf(
+                        "lastPttBeacon" to "$currentUserId: $message",
+                        "lastPttTime" to System.currentTimeMillis()
+                    )
+                )
+                _activePttBeacon.value = "Sent Voice Beacon: $message"
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    fun dismissPttBeacon() {
+        _activePttBeacon.value = null
     }
     
     private fun observeFriends() {
@@ -103,17 +131,22 @@ class GroupSessionManager(private val context: Context) {
                 
                 // Fetch details for all friends
                 // Note: Firestore 'in' query supports up to 30 items.
+                val safeFriendIds = friendIds.filter { it.isNotBlank() }.take(30)
+                if (safeFriendIds.isEmpty()) {
+                    _friends.value = emptyList()
+                    return@addSnapshotListener
+                }
                 db.collection("users")
-                    .whereIn("id", friendIds)
+                    .whereIn("id", safeFriendIds)
                     .addSnapshotListener { friendsSnapshot, fe ->
                         if (fe != null) return@addSnapshotListener
                         
                         val friendsList = friendsSnapshot?.documents?.mapNotNull { doc ->
-                            val friendUser = doc.toObject<User>()
+                            val friendUser = runCatching { doc.toObject<User>() }.getOrNull()
                             friendUser?.let {
                                 Friend(
                                     id = doc.id,
-                                    name = it.displayName,
+                                    name = it.displayName.ifBlank { "Rider" },
                                     status = try { FriendStatus.valueOf(it.status) } catch(e: Exception) { FriendStatus.OFFLINE },
                                     lastKnownLat = it.lastKnownLat,
                                     lastKnownLon = it.lastKnownLon,
@@ -137,7 +170,7 @@ class GroupSessionManager(private val context: Context) {
                 if (e != null) return@addSnapshotListener
                 
                 val sessionsList = snapshot?.documents?.mapNotNull { doc ->
-                    doc.toObject<GroupSession>()?.copy(id = doc.id)
+                    runCatching { doc.toObject<GroupSession>()?.copy(id = doc.id) }.getOrNull()
                 } ?: emptyList()
                 
                 _sessions.value = sessionsList
@@ -153,7 +186,9 @@ class GroupSessionManager(private val context: Context) {
             "currentSpeed" to speed,
             "status" to status.name
         )
-        db.collection("users").document(currentUser.uid).update(updates)
+        runCatching {
+            db.collection("users").document(currentUser.uid).set(updates, SetOptions.merge())
+        }
     }
     
     suspend fun createSession(

@@ -14,6 +14,7 @@ import com.expedition.app.features.auth.LoginScreen
 import com.expedition.app.features.auth.RegisterScreen
 import com.expedition.app.features.map.MapScreen
 import com.expedition.app.features.map.NavigationManager
+import com.expedition.app.features.map.OfflineCacheManager
 import com.expedition.app.features.map.SavedRoutesScreen
 import com.expedition.app.features.map.PlaceSearchManager
 import com.expedition.app.features.social.FriendsScreen
@@ -27,6 +28,7 @@ fun ExpeditionApp() {
     // Shared Managers (Single instances for the whole app)
     val authManager = remember { AuthManager(context) }
     val navigationManager = remember { NavigationManager(context) }
+    val offlineCacheManager = remember { OfflineCacheManager(context) }
     val searchManager = remember { PlaceSearchManager() }
     val sessionManager = remember { GroupSessionManager(context) }
     
@@ -66,6 +68,7 @@ fun ExpeditionApp() {
                     navigationManager = navigationManager,
                     searchManager = searchManager,
                     sessionManager = sessionManager,
+                    offlineCacheManager = offlineCacheManager,
                     onNavigateToFriends = { navController.navigate("friends") },
                     onNavigateToSavedRoutes = { navController.navigate("savedRoutes") },
                     onLogout = {
@@ -87,6 +90,7 @@ fun ExpeditionApp() {
             composable("savedRoutes") {
                 SavedRoutesScreen(
                     navigationManager = navigationManager,
+                    offlineCacheManager = offlineCacheManager,
                     onNavigateBack = { navController.popBackStack() },
                     onLoadRoute = { route ->
                         navigationManager.loadSavedRoute(route, null)

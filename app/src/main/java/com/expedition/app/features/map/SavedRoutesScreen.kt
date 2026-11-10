@@ -1,17 +1,17 @@
-
 package com.expedition.app.features.map
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -23,29 +23,51 @@ import java.util.*
 @Composable
 fun SavedRoutesScreen(
     navigationManager: NavigationManager,
+    offlineCacheManager: OfflineCacheManager? = null,
     onNavigateBack: () -> Unit,
     onLoadRoute: (SavedRoute) -> Unit
 ) {
     val context = LocalContext.current
-    val offlineCacheManager = remember { OfflineCacheManager(context) }
-    
+    val cacheManager = offlineCacheManager ?: remember { OfflineCacheManager(context) }
+
     val savedRoutes by navigationManager.savedRoutes.collectAsState()
-    val cachedRegions by offlineCacheManager.cachedRegions.collectAsState()
+    val cachedRegions by cacheManager.cachedRegions.collectAsState()
+
+    // Automatically pre-cache tiles in the background for all saved routes while on data
+    LaunchedEffect(savedRoutes) {
+        for (route in savedRoutes) {
+            val alreadyCached = cachedRegions.any { it.name.equals(route.name, ignoreCase = true) }
+            if (!alreadyCached && route.waypoints.isNotEmpty()) {
+                cacheManager.downloadRouteArea(
+                    mapView = null,
+                    waypoints = route.waypoints,
+                    name = route.name
+                )
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
-                title = { 
+                title = {
                     Text(
-                        "MY EXPEDITIONS", 
-                        style = MaterialTheme.typography.titleLarge,
+                        "SAVED ROUTES",
+                        style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Black,
-                        letterSpacing = 2.sp
-                    ) 
+                        letterSpacing = 1.5.sp
+                    )
                 },
                 navigationIcon = {
-                    IconButton(onClick = onNavigateBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                    IconButton(
+                        onClick = onNavigateBack,
+                        modifier = Modifier.size(56.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.ArrowBack,
+                            contentDescription = "Back",
+                            modifier = Modifier.size(28.dp)
+                        )
                     }
                 },
                 colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
@@ -61,17 +83,30 @@ fun SavedRoutesScreen(
                 .padding(paddingValues)
                 .background(MaterialTheme.colorScheme.background)
         ) {
+            // Automatic Data-Loss Protection Summary Bar
             Surface(
                 modifier = Modifier.fillMaxWidth(),
-                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
             ) {
-                Row(
-                    modifier = Modifier.padding(16.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    StatItem("Routes", savedRoutes.size.toString())
-                    StatItem("Offline Maps", cachedRegions.size.toString())
-                    StatItem("Cache", "${offlineCacheManager.getTotalCacheSize() / 1024 / 1024} MB")
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        StatItem("Saved Routes", savedRoutes.size.toString())
+                        StatItem("Auto-Cached", "${savedRoutes.size}/${savedRoutes.size}")
+                        StatItem(
+                            "Map Storage",
+                            String.format(Locale.US, "%.1f MB", cacheManager.getTotalCacheSize() / (1024f * 1024f))
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "All routes started while on mobile data are automatically saved here so you can load them anytime without Wi-Fi or cell signal.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
 
@@ -80,18 +115,21 @@ fun SavedRoutesScreen(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center
                 ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(24.dp)
+                    ) {
                         Icon(
-                            Icons.Default.Route, 
-                            contentDescription = null, 
+                            Icons.Default.Route,
+                            contentDescription = null,
                             modifier = Modifier.size(64.dp),
                             tint = MaterialTheme.colorScheme.outline
                         )
                         Spacer(modifier = Modifier.height(16.dp))
                         Text(
-                            "No routes saved yet", 
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.outline
+                            "No routes saved yet",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onSurface
                         )
                     }
                 }
@@ -104,11 +142,10 @@ fun SavedRoutesScreen(
                     items(savedRoutes) { route ->
                         RouteCard(
                             route = route,
-                            isOffline = cachedRegions.any { it.name == route.name },
                             onLoad = { onLoadRoute(route) },
-                            onDelete = { 
+                            onDelete = {
                                 navigationManager.deleteSavedRoute(route.id)
-                                offlineCacheManager.deleteRegion(route.name)
+                                cacheManager.deleteRegion(route.name)
                             }
                         )
                     }
@@ -121,18 +158,18 @@ fun SavedRoutesScreen(
 @Composable
 fun RouteCard(
     route: SavedRoute,
-    isOffline: Boolean,
     onLoad: () -> Unit,
     onDelete: () -> Unit
 ) {
     val date = remember(route.createdAt) {
-        SimpleDateFormat("MMM dd, yyyy", Locale.getDefault()).format(Date(route.createdAt))
+        SimpleDateFormat("MMM dd, yyyy • HH:mm", Locale.getDefault()).format(Date(route.createdAt))
     }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(
@@ -147,66 +184,61 @@ fun RouteCard(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = date,
-                        style = MaterialTheme.typography.labelSmall,
+                        text = "$date • ${NavigationManager.formatDistance(route.totalDistanceMeters)}",
+                        style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                
-                if (isOffline) {
-                    Surface(
-                        color = MaterialTheme.colorScheme.primaryContainer,
-                        shape = MaterialTheme.shapes.extraSmall
+
+                Surface(
+                    color = MaterialTheme.colorScheme.tertiaryContainer,
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
+                        Icon(
+                            Icons.Default.CheckCircle,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                            tint = MaterialTheme.colorScheme.onTertiaryContainer
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            "OFFLINE READY",
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            "SAVED ON DEVICE",
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                            color = MaterialTheme.colorScheme.onTertiaryContainer
                         )
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(14.dp))
 
+            // Left-Handed Action Row: Primary "LOAD ROUTE" button on the LEFT
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Icon(
-                    Icons.Default.Timeline, 
-                    contentDescription = null, 
-                    modifier = Modifier.size(16.dp),
-                    tint = MaterialTheme.colorScheme.primary
-                )
-                Spacer(modifier = Modifier.width(4.dp))
-                Text(
-                    text = NavigationManager.formatDistance(route.totalDistanceMeters),
-                    style = MaterialTheme.typography.bodyMedium
-                )
-                
-                Spacer(modifier = Modifier.weight(1f))
-
                 Button(
                     onClick = onLoad,
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-                    modifier = Modifier.height(32.dp)
+                    modifier = Modifier.height(48.dp),
+                    contentPadding = PaddingValues(horizontal = 20.dp)
                 ) {
-                    Icon(Icons.Default.Map, null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Load", style = MaterialTheme.typography.labelMedium)
+                    Icon(Icons.Default.Navigation, null, modifier = Modifier.size(20.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("LOAD ROUTE", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
                 }
 
-                Spacer(modifier = Modifier.width(8.dp))
-                
-                IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
+                IconButton(onClick = onDelete, modifier = Modifier.size(48.dp)) {
                     Icon(
-                        Icons.Default.DeleteOutline, 
+                        Icons.Default.DeleteOutline,
                         contentDescription = "Delete",
                         tint = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.size(20.dp)
+                        modifier = Modifier.size(24.dp)
                     )
                 }
             }

@@ -7,7 +7,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -24,7 +23,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
@@ -41,12 +39,16 @@ fun RegisterScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val scrollState = rememberScrollState()
 
+    val pendingUser by authManager.pendingVerificationUser.collectAsState()
+    val deviceFingerprint = remember { authManager.getDeviceFingerprintPreview() }
+
     var email by remember { mutableStateOf("") }
     var displayName by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var confirmPassword by remember { mutableStateOf("") }
     var accountType by remember { mutableStateOf(AccountType.REGULAR) }
     var isLoading by remember { mutableStateOf(false) }
+    var verificationBannerMessage by remember { mutableStateOf<String?>(null) }
 
     // Animation states
     var visible by remember { mutableStateOf(false) }
@@ -86,7 +88,7 @@ fun RegisterScreen(
                     .verticalScroll(scrollState),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Spacer(modifier = Modifier.height(64.dp))
+                Spacer(modifier = Modifier.height(48.dp))
 
                 AnimatedVisibility(
                     visible = visible,
@@ -100,14 +102,14 @@ fun RegisterScreen(
                             color = MaterialTheme.colorScheme.onBackground
                         )
                         Text(
-                            text = "Create your account",
+                            text = "Create & verify your rider identity",
                             style = MaterialTheme.typography.bodyLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
 
-                Spacer(modifier = Modifier.height(48.dp))
+                Spacer(modifier = Modifier.height(32.dp))
 
                 // Input Fields
                 AnimatedVisibility(
@@ -125,7 +127,7 @@ fun RegisterScreen(
                             singleLine = true
                         )
 
-                        Spacer(modifier = Modifier.height(16.dp))
+                        Spacer(modifier = Modifier.height(14.dp))
 
                         OutlinedTextField(
                             value = email,
@@ -138,7 +140,7 @@ fun RegisterScreen(
                             singleLine = true
                         )
 
-                        Spacer(modifier = Modifier.height(16.dp))
+                        Spacer(modifier = Modifier.height(14.dp))
 
                         OutlinedTextField(
                             value = password,
@@ -152,7 +154,7 @@ fun RegisterScreen(
                             singleLine = true
                         )
 
-                        Spacer(modifier = Modifier.height(16.dp))
+                        Spacer(modifier = Modifier.height(14.dp))
 
                         OutlinedTextField(
                             value = confirmPassword,
@@ -168,7 +170,7 @@ fun RegisterScreen(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(24.dp))
+                Spacer(modifier = Modifier.height(20.dp))
 
                 // Account Type Selection
                 AnimatedVisibility(
@@ -180,7 +182,7 @@ fun RegisterScreen(
                             "Account Type",
                             style = MaterialTheme.typography.titleSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(bottom = 12.dp)
+                            modifier = Modifier.padding(bottom = 10.dp)
                         )
                         Column(
                             Modifier.fillMaxWidth(),
@@ -188,7 +190,7 @@ fun RegisterScreen(
                         ) {
                             AccountTypeCard(
                                 title = "Regular",
-                                description = "For everyday riders",
+                                description = "For everyday riders (Requires Email Verification)",
                                 icon = Icons.Default.Person,
                                 isSelected = accountType == AccountType.REGULAR,
                                 onClick = { accountType = AccountType.REGULAR },
@@ -196,17 +198,25 @@ fun RegisterScreen(
                             )
                             AccountTypeCard(
                                 title = "Supervisor",
-                                description = "For group ride leaders",
+                                description = "For group ride leaders (Requires Email Verification)",
                                 icon = Icons.Default.SupervisedUserCircle,
                                 isSelected = accountType == AccountType.SUPERVISOR,
                                 onClick = { accountType = AccountType.SUPERVISOR },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            AccountTypeCard(
+                                title = "Developer (Device-Bound)",
+                                description = "Hardware-verified via AndroidKeyStore ($deviceFingerprint)",
+                                icon = Icons.Default.VerifiedUser,
+                                isSelected = accountType == AccountType.DEVELOPER,
+                                onClick = { accountType = AccountType.DEVELOPER },
                                 modifier = Modifier.fillMaxWidth()
                             )
                         }
                     }
                 }
 
-                Spacer(modifier = Modifier.height(40.dp))
+                Spacer(modifier = Modifier.height(28.dp))
 
                 // Action Buttons
                 AnimatedVisibility(
@@ -233,6 +243,9 @@ fun RegisterScreen(
                                     isLoading = false
                                     when (result) {
                                         is AuthResult.Success -> onRegisterSuccess(result.user)
+                                        is AuthResult.VerificationRequired -> {
+                                            verificationBannerMessage = result.message
+                                        }
                                         is AuthResult.Error -> snackbarHostState.showSnackbar(result.message)
                                     }
                                 }
@@ -251,31 +264,70 @@ fun RegisterScreen(
                                 )
                             } else {
                                 Text(
-                                    "Register Now",
+                                    "Register & Verify",
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold
                                 )
                             }
                         }
 
-                        Spacer(modifier = Modifier.height(16.dp))
+                        Spacer(modifier = Modifier.height(12.dp))
 
                         TextButton(
                             onClick = onNavigateToLogin,
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Text(
-                                "Already have an account? Login",
+                                "Already have an account? Login or use Device Key",
                                 color = MaterialTheme.colorScheme.secondary,
                                 fontWeight = FontWeight.SemiBold
                             )
                         }
                     }
                 }
-                
+
                 Spacer(modifier = Modifier.height(48.dp))
             }
         }
+    }
+
+    if (pendingUser != null) {
+        AccountVerificationDialog(
+            user = pendingUser!!,
+            statusMessage = verificationBannerMessage ?: "Verification link sent to your email.",
+            deviceFingerprint = deviceFingerprint,
+            onCheckEmailVerified = {
+                scope.launch {
+                    when (val res = authManager.checkVerificationStatus(allowDevBypass = false)) {
+                        is AuthResult.Success -> onRegisterSuccess(res.user)
+                        is AuthResult.VerificationRequired -> verificationBannerMessage = res.message
+                        is AuthResult.Error -> snackbarHostState.showSnackbar(res.message)
+                    }
+                }
+            },
+            onResendEmail = {
+                scope.launch {
+                    when (val res = authManager.sendEmailVerification()) {
+                        is AuthResult.VerificationRequired -> verificationBannerMessage = res.message
+                        is AuthResult.Error -> snackbarHostState.showSnackbar(res.message)
+                        else -> {}
+                    }
+                }
+            },
+            onVerifyWithHardwareKey = {
+                scope.launch {
+                    when (val res = authManager.checkVerificationStatus(allowDevBypass = true)) {
+                        is AuthResult.Success -> onRegisterSuccess(res.user)
+                        is AuthResult.Error -> snackbarHostState.showSnackbar(res.message)
+                        else -> {}
+                    }
+                }
+            },
+            onDismiss = {
+                authManager.logout()
+                verificationBannerMessage = null
+            }
+        )
     }
 }
 
@@ -290,7 +342,7 @@ fun AccountTypeCard(
 ) {
     val borderColor = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant
     val backgroundColor = if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.08f) else Color.Transparent
-    
+
     Card(
         modifier = modifier
             .clip(MaterialTheme.shapes.medium)

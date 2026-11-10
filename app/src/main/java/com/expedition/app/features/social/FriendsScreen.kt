@@ -270,7 +270,7 @@ fun FriendCard(
                     modifier = Modifier.size(48.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text(friend.name.first().uppercase(), style = MaterialTheme.typography.titleLarge)
+                    Text(friend.name.firstOrNull()?.uppercase() ?: "R", style = MaterialTheme.typography.titleLarge)
                 }
                 Box(modifier = Modifier.size(14.dp).clip(CircleShape).background(statusColor).align(Alignment.BottomEnd))
             }
